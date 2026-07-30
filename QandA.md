@@ -101,3 +101,36 @@ SPEC.mdのレビューで確認が必要な事項を記録する。
 - 質問内容: エラー通知メールを送信できなかった場合の扱いは何か。また、元メールの送信者が存在しない・無効なUIDの場合、どこへ通知し、どの状態で停止するか。
 - 推奨案: 通知送信自体の失敗をログと引継ぎへ記録し、`HUMAN_REQUIRED`で停止する。通知先が無効な場合も同じ扱いとし、エラー通知の再帰送信は行わない。
 - 回答: エラー通知メールの送信に失敗した場合は再帰的な通知を作成せず、失敗をログと引継ぎへ記録し、対象依頼を`HUMAN_REQUIRED`として自動処理を停止する。無効な送信者UIDの場合も同じ扱いとし、通知先を別AIへ変更しない。オーケストレーター自身への通知も作成しない。
+
+## Q011
+
+- 状態: ANSWERED
+- 重要度: 中
+- 質問者: Claude Code
+- 対象ファイル: orchestrator/SPEC.md, orchestrator/SEQUENCE.md
+- 質問内容: 最初の作業依頼メールを実際に送信する主体はどちらか。SPEC.md 9.1は「人間またはChatGPTが最初の作業依頼を作成する」と定義しているが、SPEC.md 29章手順2は「指揮AIからClaude Codeへ日本語の作業依頼を送信」と記載しており、送信者UIDが人間側か指揮AI側かで食い違う。また、手順2の時点ではオーケストレーターがまだ指揮AIを起動していないため、初回の指揮AIをどのように起動するかも未定義である。
+- 推奨案: 人間/ChatGPTが目的・制約を与えて指揮AIを手動で1回起動し、実際の作業依頼メールの送信者は指揮AIとする。
+- 回答: 最初の作業開始時は、人間またはChatGPTが目的・制約・初期指示を与え、指揮AIを1回だけ手動で起動する。指揮AIは次を行う。(1)依頼内容を確定する、(2)依頼IDを生成する、(3)`send_mail`を使用して作業AIへ最初の作業依頼メールを送信する。オーケストレーターによる自動処理は、この最初のメールが送信された後から開始する。したがって、最初の作業依頼メールの送信者UIDは指揮AIのUIDとする。作業AIで発生したエラー通知、回答、QandA、完了報告の返信先も原則として指揮AIのUIDとする。人間またはChatGPTはメールシステム上の作業依頼送信者ではなく、指揮AIへ初期目的を与える起動者として扱う。
+
+反映先: SPEC.md 9.1（起動者としての役割・送信者ではない旨を明記）、9.3（依頼内容確定・依頼ID生成・`send_mail`送信を追加）、17章（最初の依頼IDは指揮AIが生成）、29章手順2および補足段落。USECASE.md UC-01（「最初の作業を開始する」へ改題、アクターを起動者／送信者に分離）、UC-02事前条件、アクター一覧、ユースケース図。SEQUENCE.md 1章手順2。UI.md 2.1空状態（初回未読0件時の案内）。TESTCASE.md T-040a/T-040b/T-040c/T-110。
+
+## Q012
+
+- 状態: ANSWERED
+- 重要度: 高
+- 質問者: Claude Code
+- 対象ファイル: orchestrator/SPEC.md, orchestrator/CLASS.md, mail/SPEC.md
+- 質問内容: オーケストレーターは、返信メールの確認（SPEC.md 30章）とSTALE復旧時の元メール状態確認（SPEC.md 24章）を、どの手段で実現するか。SPEC.md 7章が`orchestrator`へ許可している`mail`の公開関数は`register_user` / `list_users` / `send_mail` / `check_mail` / `receive_mail`の5つだけだが、`check_mail`は未読数しか返さず、`receive_mail`は取得と同時に既読化して本来の受信者からメールを奪ってしまう。したがって「他AI宛てのメールを既読化せずに、送受信者UID・件名の依頼ID・メールID・作成時刻で照合する」という30章の必須要件を、公開関数だけでは実現できない。
+- 推奨案: `MailReplyQuery`がメールDBへ読み取り専用で直接問い合わせる（正式回答により**不採用**）。
+- 回答: `orchestrator`からメールDBへ直接SQLアクセスする案は採用しない。既存`mail`パッケージへ、既読状態を変更しない汎用的な読み取り専用検索APIを追加する。公開関数名は原則として`find_mails(*, sender_uid=None, recipient_uid=None, request_id=None, after_mail_id=None, created_after=None, is_read=None)`とする。戻り値には最低限、メールID・送信者UID・受信者UID・件名・本文・作成日時・既読状態を含める。`find_mails`は`SELECT`のみを行い、検索対象メールの既読状態を一切変更してはならない。具体的な引数形式・型・戻り値形式は既存`mail`パッケージの設計・命名規則に合わせて調整してよいが、オーケストレーターがSQLiteのテーブル名・列名・接続方法を直接知る構造にはしない。`MailReplyQuery`はDBへ直接アクセスするクラスではなく、`MailModuleAdapter`または同等のアダプターを通して`find_mails`を呼び出す構造とする。SPEC.md 7章の利用可能な公開関数一覧へ`find_mails`を追加する。
+
+命名の調整（既存`mail`パッケージの規則に合わせた確定形）:
+
+- `created_after` → **`sent_after`**（`mails`テーブルの列名および`receive_mail`の戻り値キーが`sent_at`であり、`created_at`は`users`テーブルの列であるため、混同を避ける）
+- `limit`（件数上限）を任意引数として追加
+- `request_id`は`mails`テーブルに専用列が存在しないため、**件名に`[<request_id>]`を含むかどうかの部分文字列一致**として`mail`側が解決する。これにより呼び出し側は件名の格納形式・SQLワイルドカード書式に依存しない
+- 戻り値は`receive_mail`の形へ`recipient_name`・`is_read`・`read_at`を追加した形とする
+
+反映先: mail/SPEC.md 4章・12章・16.8節（新規）・17章・18章・23.1節（試験8〜9を新規追加）・25章・26章、mail/README.md「公開API」。orchestrator/SPEC.md 7章・24章・30章「返信メールの確認」。USECASE.md UC-03主フロー4・UC-09主フロー3。SEQUENCE.md 1章・2章・4章。CLASS.md（`MailModuleAdapter`へ`find_mails`追加、`MailReplyQuery`をアダプター経由へ変更、設計上の注意）。TESTCASE.md 7.5節 T-073〜T-079b。
+
+補足: `find_mails`の**実装**（`mail/agent_mail.py`・`mail/__init__.py`・`mail/tests/test_agent_mail.py`）は未着手である。仕様・API文書・試験要件のみを確定した段階であり、オーケストレーター実装の前に`mail`側の実装が必要となる。

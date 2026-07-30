@@ -16,8 +16,11 @@ sequenceDiagram
     Human->>Mail: register_user(指揮AI), register_user(作業AI)
     Mail-->>Human: 各AIのUIDを発行
 
-    Note over Human,Mail: 手順2: 指揮AIからClaude Codeへ日本語の作業依頼を送信
-    Human->>Mail: send_mail(依頼ID付き, 宛先=作業AI)
+    Note over Human,Worker: 手順2: 指揮AIからClaude Codeへ日本語の作業依頼を送信<br/>(人間/ChatGPTは起動者であり、メール上の送信者にはならない。SPEC.md 9.1/9.3/29章)
+    Human->>Commander: 目的・制約・初期指示を与えて手動起動(初回のみ)
+    Commander->>Commander: 依頼内容を確定し依頼IDを生成
+    Commander->>Mail: send_mail(依頼ID付き, 宛先=作業AI, 送信者=指揮AI_uid)
+    Note over Orc: オーケストレーターの自動処理はここから開始する
 
     Note over Orc,Mail: 手順3: オーケストレーターが未読を検出
     loop メール確認間隔ごと
@@ -42,7 +45,8 @@ sequenceDiagram
     Worker-->>Orc: CLI終了(終了コード0)
     Orc->>Mail: check_mail(作業AI_uid)
     Mail-->>Orc: 未読数 = 0
-    Orc->>Orc: 返信確認(依頼ID一致・送受信者UID一致)
+    Orc->>Mail: find_mails(sender_uid, recipient_uid, request_id, after_mail_id, sent_after)
+    Mail-->>Orc: 返信メール(既読化しない)
 
     Note over Orc,Mail: 手順8: オーケストレーターが指揮AI宛てメールを検出
     Orc->>Mail: check_mail(指揮AI_uid)
@@ -62,7 +66,8 @@ sequenceDiagram
     Commander-->>Orc: CLI終了(終了コード0)
     Orc->>Mail: check_mail(指揮AI_uid)
     Mail-->>Orc: 未読数 = 0
-    Orc->>Orc: 返信確認(依頼ID一致・送受信者UID一致)
+    Orc->>Mail: find_mails(sender_uid, recipient_uid, request_id, after_mail_id, sent_after)
+    Mail-->>Orc: 返信メール(既読化しない)
 
     Note over Orc,Worker: 手順12: オーケストレーターがClaude Codeを再起動
     Orc->>Mail: check_mail(作業AI_uid)
@@ -111,7 +116,7 @@ sequenceDiagram
         else 0以外の終了コード/予期せぬ終了
             Orc->>Orc: 判定=FAILED(既読化済みのため再試行しない)
         else 終了コード0
-            Orc->>Mail: 返信確認タイムアウトまでポーリング
+            Orc->>Mail: 返信確認タイムアウトまで find_mails でポーリング(既読化しない)
             alt 返信あり(送受信者UID一致・依頼ID一致・メールID>元メールID・起動後作成)
                 Mail-->>Orc: 返信メール確認
                 Orc->>Orc: 正常完了として記録
@@ -181,7 +186,9 @@ sequenceDiagram
             Orc->>Orc: 実行中とみなす(何もしない)
         else PID不一致/開始時刻不一致/確認不可
             Orc->>Orc: STALE候補として記録
-            Orc->>Mail: 元メールの既読・返信状態を確認
+            Orc->>Mail: find_mails(元メールの既読状態を確認)
+            Orc->>Mail: find_mails(sender_uid, recipient_uid, request_id,<br/>after_mail_id=元メールID, sent_after=記録された起動日時)
+            Note over Orc,Mail: 返信の判定条件は30章と同一(依頼IDだけで判定しない)<br/>receive_mailは使用しない(元メールを奪って既読化し判定を破壊するため)
             alt 元メールが未読
                 Orc->>Orc: 再処理候補として次回起動サイクルへ
             else 既読かつ返信なし

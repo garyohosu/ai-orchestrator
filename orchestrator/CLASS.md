@@ -54,6 +54,7 @@ classDiagram
         +send_mail(sender_uid, recipient_uid, subject, body) int
         +check_mail(uid: str) int
         +receive_mail(uid: str) list~dict~
+        +find_mails(sender_uid, recipient_uid, request_id, after_mail_id, sent_after, is_read, limit) list~dict~
     }
 
     class CliLauncher {
@@ -86,9 +87,31 @@ classDiagram
         +duration_sec: float
     }
 
+    class MailReplyQuery {
+        -mail_module: MailModuleAdapter
+        +find_reply(expected: ExpectedReply) ReplyCheckResult
+        +get_mail_read_state(mail_id: int) str
+        +has_any_reply(job_id: str, origin_mail_id: int) bool
+    }
+
     class ReplyVerifier {
+        -query: MailReplyQuery
         +wait_for_reply(expected: ExpectedReply, timeout_sec: int) ReplyCheckResult
         -matches(mail: dict, expected: ExpectedReply) bool
+    }
+
+    class RoundTripCounter {
+        +max_round_trips: int
+        +count(job_id: str) int
+        +increment(job_id: str) int
+        +is_exceeded(job_id: str) bool
+    }
+
+    class RunDurationGuard {
+        +max_run_duration_sec: int
+        +started_at: datetime
+        +should_stop() bool
+        +remaining_sec() int
     }
 
     class ExpectedReply {
@@ -228,6 +251,7 @@ classDiagram
         -notifier: ErrorNotifier
         -logger: JobLogger
         -checkpoint_store: CheckpointStore
+        -round_trips: RoundTripCounter
         +run_one_pass(agents: list~AgentDefinition~) void
         -process_agent(agent: AgentDefinition) void
     }
@@ -237,6 +261,7 @@ classDiagram
     OrchestratorMain --> DispatchCycle
     OrchestratorMain --> StaleRecoveryService
     OrchestratorMain --> RuntimeStateStore
+    OrchestratorMain --> RunDurationGuard
     OrchestratorConfig --> AgentDefinition
     DispatchCycle --> MailWatcher
     DispatchCycle --> CliLauncher
@@ -247,10 +272,12 @@ classDiagram
     DispatchCycle --> JobLogger
     DispatchCycle --> CheckpointStore
     DispatchCycle --> RuntimeStateStore
+    DispatchCycle --> RoundTripCounter
     MailWatcher --> MailModuleAdapter
     ErrorNotifier --> MailModuleAdapter
     ErrorNotifier --> NotificationDetail
-    ReplyVerifier --> MailModuleAdapter
+    ReplyVerifier --> MailReplyQuery
+    MailReplyQuery --> MailModuleAdapter
     ReplyVerifier --> ExpectedReply
     ReplyVerifier --> ReplyCheckResult
     CliLauncher --> CliPathResolver
@@ -260,6 +287,7 @@ classDiagram
     RetryPolicy --> OutcomeStatus
     StaleRecoveryService --> RuntimeStateStore
     StaleRecoveryService --> MailModuleAdapter
+    StaleRecoveryService --> MailReplyQuery
     StaleRecoveryService --> RecoveryAction
     RuntimeStateStore --> RunningAgentState
     CheckpointStore --> Checkpoint
@@ -274,10 +302,13 @@ classDiagram
 | `PathResolver` | `orchestrator.py`自身の位置基準でのパス解決、`project_path`の正規化・範囲チェック | 5章, 6章 |
 | `OrchestratorConfig` / `AgentDefinition` | `config.json`の読み込みと安全な既定値の適用、エージェント定義順の保持 | 10章, 16章 |
 | `MailWatcher` | `check_mail`による未読監視、エージェント定義順・メールID昇順の走査 | 15章, 16章 |
-| `MailModuleAdapter` | `mail`パッケージ関数への薄いラッパー（唯一の依存境界） | 7章 |
+| `MailModuleAdapter` | `mail`パッケージ関数（`register_user` / `list_users` / `send_mail` / `check_mail` / `receive_mail` / `find_mails`）への薄いラッパー。`mail`への唯一の依存境界 | 7章 |
 | `CliLauncher` / `CliPathResolver` | CLI検出順（config→PATH→既定名）、`subprocess`によるコマンド・引数分離起動、固定指示の生成、UTF-8環境変数の設定 | 11章, 12章, 21章 |
 | `LaunchedProcess` / `ProcessResult` | 起動済みプロセスの待機・終了コード・タイムアウト検出 | 12章, 15章 |
+| `MailReplyQuery` | `MailModuleAdapter.find_mails`を用いた、既読状態を変更しない参照。返信照合条件（送受信者UID・依頼ID・元メールID超過・CLI起動後）を`find_mails`の引数へ組み立てる。DBへ直接アクセスしない | 7章, 24章, 30章「返信メールの確認」 |
 | `ReplyVerifier` / `ExpectedReply` / `ReplyCheckResult` | 返信確認タイムアウト内での返信メール照合（送受信者UID・依頼ID・メールID・作成時刻） | 30章「返信メールの確認」 |
+| `RoundTripCounter` | 依頼ID単位の往復回数の計数と`最大往復回数`到達判定。完了報告・エラー通知・受領通知は計数しない | 10章, 25章 |
+| `RunDurationGuard` | 常時監視モードの`最大連続実行時間`監視と安全停止判定（0のときだけ無期限） | 10章, 14章 |
 | `OutcomeClassifier` / `OutcomeStatus` | 起動可否・終了コード・タイムアウト・返信有無から状態を確定 | 26章, 30章 |
 | `RetryPolicy` | 未受信が明らかな場合のみ最大再試行回数まで再試行を許可 | 10章, 26章 |
 | `ErrorNotifier` / `NotificationDetail` | システム送信者としてのエラー通知作成、秘密情報除去、再帰通知防止 | 30章 |
@@ -289,7 +320,11 @@ classDiagram
 
 ## 3. 設計上の注意
 
-* `MailModuleAdapter`は`mail`パッケージの公開関数のみを呼び出し、`mail`側のテーブル構造へ直接アクセスしない（SPEC.md 7章「メールシステム本体へ、AI起動処理やオーケストレーション処理を追加してはならない」）。
+* `MailModuleAdapter`は`mail`パッケージの公開関数（`register_user` / `list_users` / `send_mail` / `check_mail` / `receive_mail` / `find_mails`）のみを呼び出す（SPEC.md 7章「メールシステム本体へ、AI起動処理やオーケストレーション処理を追加してはならない」）。
+* 返信確認（SPEC.md 30章）とSTALE復旧（SPEC.md 24章）は、**他AI宛てのメールを既読化せずに参照する**必要がある。`check_mail`は未読数しか返さず、`receive_mail`は取得と同時に既読化して本来の受信者からメールを奪ってしまうため、いずれも使用できない。この用途には`mail`側の読み取り専用検索API`find_mails`を使用する（QandA Q012、`mail/SPEC.md`第16.8節）。
+* **`orchestrator`はメールDBへSQLで直接アクセスしない。**SQLiteのテーブル名・列名・接続方法を`orchestrator`側が知る構造にしてはならない。`MailReplyQuery`はDBアクセスクラスではなく、`MailModuleAdapter`経由で`find_mails`を呼び出し、照合条件を引数へ組み立てる責務だけを持つ。
+* 依頼IDによる絞り込みは`find_mails(request_id=...)`へ委譲する。件名に`[<依頼ID>]`が含まれるかどうかの判定は`mail`側が行うため、`orchestrator`は件名の格納形式やSQLのワイルドカード書式に依存しない。
+* `find_mails`の追加は検索機能の追加であって、AI起動処理やオーケストレーション処理の追加ではない。`mail`パッケージは引き続きAI CLIを検出・起動せず、`orchestrator`を削除しても`mail`単体で動作する（依存方向は`orchestrator → mail`の一方向のみ）。
 * `orchestrator`を削除しても`mail`単体が動作するよう、依存方向は`orchestrator → mail`の一方向のみとする。
 * `PathResolver`はカレントディレクトリを一切参照しない。すべての相対パス解決は`orchestrator.py`の実体パスを起点とする。
 * `OutcomeStatus`の`HUMAN_REQUIRED`は、認証切れ・対象ファイル不足・破壊的操作・判定不能な場合に加え、エラー通知自体の送信失敗や無効な送信者UIDの場合にも設定される（`ErrorNotifier`側で終端化）。
