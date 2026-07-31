@@ -151,6 +151,8 @@ class OrchestratorContext:
             agents=self.config.agents,
             system_sender_uid=self.system_uid,
             max_handoffs=self.config.max_handoffs,
+            terminal_poll_interval_sec=self.config.terminal_poll_interval_sec,
+            terminal_grace_sec=self.config.terminal_grace_sec,
         )
 
         self.run_duration_guard = RunDurationGuard(self.config.max_run_duration_sec)

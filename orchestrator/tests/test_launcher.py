@@ -78,6 +78,32 @@ class CliLauncherTests(unittest.TestCase):
         self.assertTrue(result.timed_out)
         self.assertIsNone(result.exit_code)
 
+    def test_waiting_notification_stops_without_timeout(self) -> None:
+        launcher = self._launcher_for("sleep_forever.py")
+        launched = launcher.launch(self._agent("sleep_forever.py"), "JOB-1", 1, self.project_path)
+        result = launched.wait(
+            timeout_sec=10,
+            terminal_reply_check=lambda: ("WAITING_FOR_DECISION", 42),
+            poll_interval_sec=0.05,
+            terminal_grace_sec=0.05,
+        )
+        self.assertEqual(result.terminal_status, "WAITING_FOR_DECISION")
+        self.assertEqual(result.terminal_mail_id, 42)
+        self.assertFalse(result.timed_out)
+
+    def test_waiting_notification_allows_natural_exit(self) -> None:
+        launcher = self._launcher_for("sleep_then_exit.py")
+        launched = launcher.launch(self._agent("sleep_then_exit.py"), "JOB-1", 1, self.project_path)
+        result = launched.wait(
+            timeout_sec=10,
+            terminal_reply_check=lambda: ("WAITING_FOR_DECISION", 43),
+            poll_interval_sec=0.05,
+            terminal_grace_sec=1,
+        )
+        self.assertEqual(result.terminal_status, "WAITING_FOR_DECISION")
+        self.assertEqual(result.exit_code, 0)
+        self.assertFalse(result.timed_out)
+
     def test_instruction_delivered_via_stdin_not_argv(self) -> None:
         out_path = self.project_path / "captured.txt"
         agent = AgentDefinition(

@@ -1,3 +1,4 @@
+import json
 import sys
 import tempfile
 import unittest
@@ -360,6 +361,21 @@ class FailureClassificationTests(unittest.TestCase):
         agent = _agent("worker", worker, "sleep_forever.py")
         outcomes = h.cycle.run_one_pass([agent])
         self.assertEqual(outcomes[0].status, OutcomeStatus.TIMEOUT)
+
+    def test_waiting_terminal_mail_stops_running_cli_without_timeout(self) -> None:
+        h = DispatchCycleHarness(max_retries=0)
+        commander = h.mail.register_user("commander")
+        worker = h.mail.register_user("worker")
+        h.mail.send_mail(commander, worker, "[JOB-A] [DEC-1] 依頼", "b")
+        h.reply_after_launch(
+            worker, commander, "[JOB-A] [DEC-1] STATUS: WAITING_FOR_DECISION",
+            json.dumps({"status": "WAITING_FOR_DECISION", "job_id": "JOB-A", "decision_id": "DEC-1"}),
+        )
+        agent = _agent("worker", worker, "sleep_forever.py")
+        h.cycle._cli_timeout_sec = 3
+        outcomes = h.cycle.run_one_pass([agent])
+        self.assertEqual(outcomes[0].status, OutcomeStatus.SUCCESS)
+        self.assertFalse(any("TIMEOUT" in mail["subject"] for mail in h.mail._mails))
 
     def test_delivery_failed_retries_up_to_max_then_notifies(self) -> None:
         h = DispatchCycleHarness(max_retries=2)

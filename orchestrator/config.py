@@ -21,6 +21,8 @@ DEFAULT_CLI_OUTPUT_MAX_BYTES = 1024 * 1024
 DEFAULT_CLI_OUTPUT_RING_BYTES = 64 * 1024
 DEFAULT_NOTIFICATION_TAIL_BYTES = 8 * 1024
 DEFAULT_MAX_HANDOFFS = 3
+DEFAULT_TERMINAL_POLL_INTERVAL_SEC = 1
+DEFAULT_TERMINAL_GRACE_SEC = 2
 
 # Same contract as mail/SPEC.md's UID format: "UID" + 6 or more ASCII digits.
 _UID_PATTERN = re.compile(r"^UID[0-9]{6,}$")
@@ -58,6 +60,8 @@ class OrchestratorConfig:
     cli_output_ring_bytes: int
     notification_tail_bytes: int
     max_handoffs: int
+    terminal_poll_interval_sec: int
+    terminal_grace_sec: int
 
 
 def _positive_int(data: dict[str, Any], key: str, default: int) -> int:
@@ -187,5 +191,7 @@ def load(path: Path) -> OrchestratorConfig:
             data, "notification_tail_bytes", DEFAULT_NOTIFICATION_TAIL_BYTES
         ),
         max_handoffs=_nonnegative_int(data, "max_handoffs", DEFAULT_MAX_HANDOFFS),
+        terminal_poll_interval_sec=_positive_int(data, "terminal_poll_interval_sec", DEFAULT_TERMINAL_POLL_INTERVAL_SEC),
+        terminal_grace_sec=_positive_int(data, "terminal_grace_sec", DEFAULT_TERMINAL_GRACE_SEC),
     )
     return config

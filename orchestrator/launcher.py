@@ -104,6 +104,8 @@ class ProcessResult:
     stdout: OutputArtifact | None = None
     stderr: OutputArtifact | None = None
     cli_evidence: CliEvidence = CliEvidence()
+    terminal_status: str | None = None
+    terminal_mail_id: int | None = None
 
 
 class LaunchedProcess:
@@ -184,26 +186,51 @@ class LaunchedProcess:
         """Finalize output after an externally interrupted wait."""
         return self._finish_capture()
 
-    def wait(self, timeout_sec: float) -> ProcessResult:
+    def wait(self, timeout_sec: float, *, terminal_reply_check=None,
+             poll_interval_sec: float = 1.0, terminal_grace_sec: float = 2.0) -> ProcessResult:
         started = time.monotonic()
         timed_out = False
         terminated_confirmed = True
         self._start_capture()
-        try:
-            self._popen.wait(timeout=timeout_sec)
-            exit_code: int | None = self._popen.returncode
-        except subprocess.TimeoutExpired:
-            timed_out = True
-            self.terminate()
+        terminal_status = None
+        terminal_mail_id = None
+        deadline = started + timeout_sec
+        while True:
+            if terminal_reply_check is not None:
+                detected = terminal_reply_check()
+                if detected is not None:
+                    terminal_status, terminal_mail_id = detected
+                    grace_deadline = time.monotonic() + terminal_grace_sec
+                    while self._popen.poll() is None and time.monotonic() < grace_deadline:
+                        time.sleep(min(0.1, max(0.0, grace_deadline - time.monotonic())))
+                    if self._popen.poll() is None:
+                        self.terminate()
+                        try:
+                            self._popen.wait(timeout=10)
+                        except subprocess.TimeoutExpired:
+                            pass
+                    exit_code = self._popen.poll()
+                    terminated_confirmed = exit_code is not None
+                    break
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                timed_out = True
+                self.terminate()
+                try:
+                    self._popen.wait(timeout=10)
+                except subprocess.TimeoutExpired:
+                    pass
+                exit_code = None
+                terminated_confirmed = self._popen.poll() is not None
+                break
             try:
-                self._popen.wait(timeout=10)
+                self._popen.wait(timeout=min(poll_interval_sec, remaining))
+                exit_code = self._popen.returncode
+                break
             except subprocess.TimeoutExpired:
-                pass
-            exit_code = None
-            # poll() reflects Python's own child-reaping state, independent
-            # of whether the communicate() above raised again: if the
-            # process is truly gone, poll() returns its exit code.
-            terminated_confirmed = self._popen.poll() is not None
+                continue
+        if timed_out:
+            timed_out = True
         stdout, stderr = self._finish_capture()
         classify_output = getattr(self._adapter, "classify_output", None)
         evidence = (
@@ -220,6 +247,8 @@ class LaunchedProcess:
             stdout=stdout,
             stderr=stderr,
             cli_evidence=evidence,
+            terminal_status=terminal_status,
+            terminal_mail_id=terminal_mail_id,
         )
 
     def terminate(self) -> None:

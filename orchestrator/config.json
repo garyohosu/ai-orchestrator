@@ -2,6 +2,8 @@
   "mail_check_interval_sec": 5,
   "cli_timeout_sec": 1800,
   "reply_check_timeout_sec": 30,
+  "terminal_poll_interval_sec": 1,
+  "terminal_grace_sec": 2,
   "max_round_trips": 10,
   "max_retries": 2,
   "max_run_duration_sec": 14400,

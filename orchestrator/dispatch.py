@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+import json
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
@@ -392,6 +393,8 @@ class DispatchCycle:
         agents: list[AgentDefinition] | None = None,
         system_sender_uid: str | None = None,
         max_handoffs: int = 3,
+        terminal_poll_interval_sec: float = 1.0,
+        terminal_grace_sec: float = 2.0,
     ) -> None:
         self._watcher = watcher
         self._launcher = launcher
@@ -412,6 +415,8 @@ class DispatchCycle:
         self._agents_by_name = {a.name: a for a in (agents or [])}
         self._system_sender_uid = system_sender_uid
         self._max_handoffs = max_handoffs
+        self._terminal_poll_interval_sec = terminal_poll_interval_sec
+        self._terminal_grace_sec = terminal_grace_sec
 
     def run_one_pass(
         self, agents: list[AgentDefinition], should_stop_launching: Callable[[], bool] | None = None
@@ -446,6 +451,34 @@ class DispatchCycle:
             return AgentOutcome(agent, OutcomeStatus.HUMAN_REQUIRED, job_id, origin_mail["mail_id"])
 
         status, process_result, retry_count = self._launch_with_retries(agent, job_id, origin_mail)
+
+        if process_result is not None and process_result.terminal_status is not None:
+            terminal_status = process_result.terminal_status
+            self._terminal_store.mark(origin_mail["mail_id"], terminal_status)
+            self._checkpoint_store.save(
+                Checkpoint(
+                    job_id=job_id,
+                    purpose=origin_mail["subject"],
+                    current_state=terminal_status,
+                    next_actions=["directorへ次の処理を委任" if terminal_status == "WAITING_FOR_DECISION" else "終端状態を保持"],
+                )
+            )
+            self._logger.log_outcome(
+                LogEntry(
+                    job_id=job_id,
+                    mail_id=origin_mail["mail_id"],
+                    agent_name=agent.name,
+                    command_summary=None,
+                    started_at=None,
+                    finished_at=now_iso(),
+                    exit_code=process_result.exit_code,
+                    result=status.value,
+                    stdout_artifact=self._artifact_dict(process_result, "stdout"),
+                    stderr_artifact=self._artifact_dict(process_result, "stderr"),
+                    classification=self._classification_dict(process_result),
+                )
+            )
+            return AgentOutcome(agent, status, job_id, origin_mail["mail_id"])
 
         if status == OutcomeStatus.SUCCESS:
             self._round_trips.increment(job_id)
@@ -765,7 +798,12 @@ class DispatchCycle:
             )
         )
         try:
-            process_result = launched.wait(self._cli_timeout_sec)
+            process_result = launched.wait(
+                self._cli_timeout_sec,
+                terminal_reply_check=self._terminal_reply_checker(agent, origin_mail, job_id),
+                poll_interval_sec=self._terminal_poll_interval_sec,
+                terminal_grace_sec=self._terminal_grace_sec,
+            )
         except ForceStopRequested:
             # Second Ctrl+C: SPEC.md 25章 requires the process be force-
             # terminated, the fact recorded, and the origin sender notified
@@ -843,10 +881,52 @@ class DispatchCycle:
             )
             reply_found = reply_result.found
 
-        status = self._classifier.classify(
-            cli_launch_failed=False, process_result=process_result, reply_found=reply_found
-        )
+        terminal_status = process_result.terminal_status
+        if terminal_status in {"WAITING_FOR_DECISION", "COMPLETED"}:
+            status = OutcomeStatus.SUCCESS
+            reply_found = True
+        elif terminal_status == "HUMAN_REQUIRED":
+            status = OutcomeStatus.HUMAN_REQUIRED
+        elif terminal_status in {"FAILED", "REJECTED", "CANCELLED"}:
+            status = OutcomeStatus.FAILED
+        else:
+            status = self._classifier.classify(
+                cli_launch_failed=False, process_result=process_result, reply_found=reply_found
+            )
         return status, process_result
+
+    def _terminal_reply_checker(self, agent: AgentDefinition, origin_mail: dict, job_id: str):
+        reply_to_uid = resolve_reply_to_uid(self._mail, origin_mail)
+        decision_match = _DECISION_ID_PATTERN.search(origin_mail.get("subject", ""))
+        decision_id = decision_match.group(1) if decision_match else None
+        not_before = shift_ms(origin_mail.get("sent_at", now_iso()), -1)
+
+        def check():
+            matches = self._mail.find_mails(
+                sender_uid=agent.uid, recipient_uid=reply_to_uid, request_id=job_id,
+                after_mail_id=origin_mail["mail_id"], sent_after=not_before, limit=20,
+            )
+            for message in matches:
+                subject = message.get("subject", "")
+                body = message.get("body", "")
+                dec_match = _DECISION_ID_PATTERN.search(subject)
+                if decision_id != (dec_match.group(1) if dec_match else None):
+                    continue
+                status = None
+                try:
+                    payload = json.loads(body)
+                    status = payload.get("status") if isinstance(payload, dict) else None
+                except (TypeError, json.JSONDecodeError):
+                    pass
+                if status not in {"WAITING_FOR_DECISION", "COMPLETED", "FAILED", "HUMAN_REQUIRED", "REJECTED", "CANCELLED"}:
+                    for candidate in ("WAITING_FOR_DECISION", "COMPLETED", "HUMAN_REQUIRED", "REJECTED", "CANCELLED", "FAILED"):
+                        if candidate in subject or f"status: {candidate}" in body:
+                            status = candidate
+                            break
+                if status in {"WAITING_FOR_DECISION", "COMPLETED", "FAILED", "HUMAN_REQUIRED", "REJECTED", "CANCELLED"}:
+                    return status, int(message["mail_id"])
+            return None
+        return check
 
     def _finalize_without_notify(
         self, agent: AgentDefinition, job_id: str, origin_mail: dict, status: OutcomeStatus, reason: str
