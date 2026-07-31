@@ -134,3 +134,15 @@ SPEC.mdのレビューで確認が必要な事項を記録する。
 反映先: mail/SPEC.md 4章・12章・16.8節（新規）・17章・18章・23.1節（試験8〜9を新規追加）・25章・26章、mail/README.md「公開API」。orchestrator/SPEC.md 7章・24章・30章「返信メールの確認」。USECASE.md UC-03主フロー4・UC-09主フロー3。SEQUENCE.md 1章・2章・4章。CLASS.md（`MailModuleAdapter`へ`find_mails`追加、`MailReplyQuery`をアダプター経由へ変更、設計上の注意）。TESTCASE.md 7.5節 T-073〜T-079b。
 
 補足: `find_mails`の**実装**（`mail/agent_mail.py`・`mail/__init__.py`・`mail/tests/test_agent_mail.py`）は未着手である。仕様・API文書・試験要件のみを確定した段階であり、オーケストレーター実装の前に`mail`側の実装が必要となる。
+
+## Q013
+
+- 状態: ANSWERED
+- 重要度: 高
+- 質問者: Claude Code
+- 対象ファイル: orchestrator/SPEC.md 15章, orchestrator/CLASS.md
+- 質問内容: SPEC.md 15章は「実際に処理するメールの取得には`receive_mail(uid)`を使用する」と記載しているが、`receive_mail`は取得と同時に既読化する。SEQUENCE.md手順4・UC-04主フローでは、AIのCLIプロセス自身が起動後に`receive_mail(uid)`を呼んで自分宛てメールを取得する設計になっている。オーケストレーター（`MailWatcher`/`DispatchCycle`）がAI起動前に`receive_mail`を呼んでしまうと、起動されたAIプロセスが自分宛てのメールを`receive_mail`しても空リストしか得られず、実際の作業指示を読めなくなる。オーケストレーター自身は`receive_mail`をどの場面で使うべきか。
+- 推奨案: オーケストレーターは未読件数の確認に`check_mail`、起動判断に必要なメタデータ（元メールID・送信者UID・依頼ID）の取得に`find_mails(recipient_uid=uid, is_read=False)`を使用し、`receive_mail`はAI CLIプロセス自身だけが呼ぶものとして、オーケストレーターのディスパッチ経路からは一切呼ばない。
+- 回答: 上記推奨案のとおりとする。`MailModuleAdapter`は`receive_mail`をラップして公開し続けるが（SPEC.md 7章が列挙する6公開関数の一つであるため）、`DispatchCycle`・`MailWatcher`などオーケストレーターの自動処理経路からは呼び出さない。未読件数の確認は`check_mail(uid)`、起動判断・ログ・エラー通知・往復回数計上に必要な元メールのメタデータ（メールID・送信者UID・件名中の依頼ID）取得は`find_mails(recipient_uid=uid, is_read=False, limit=...)`を用いる。これにより、対象AI宛ての未読メールはAI自身が起動後に`receive_mail`で取得するまで未読のまま維持され、オーケストレーターが横取りしない。単体テストでは、インメモリのメールアダプターが`receive_mail`の呼び出し回数を記録し、一連のディスパッチサイクルを通じて0回のままであることを検証する。
+
+反映先: orchestrator実装（`MailWatcher`・`DispatchCycle`の実装方針）。SPEC.md本文の修正は行わない範囲の運用上の明確化とする。

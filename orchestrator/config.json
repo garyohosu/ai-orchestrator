@@ -1,0 +1,26 @@
+{
+  "mail_check_interval_sec": 5,
+  "cli_timeout_sec": 1800,
+  "reply_check_timeout_sec": 30,
+  "max_round_trips": 10,
+  "max_retries": 2,
+  "max_run_duration_sec": 14400,
+  "project_path": "",
+  "logs_dir": "logs",
+  "checkpoints_dir": "checkpoints",
+  "runtime_dir": "runtime",
+  "agents": [
+    {
+      "name": "commander",
+      "uid": "UID000001",
+      "cli_type": "codex",
+      "command": []
+    },
+    {
+      "name": "worker",
+      "uid": "UID000002",
+      "cli_type": "claude_code",
+      "command": []
+    }
+  ]
+}
