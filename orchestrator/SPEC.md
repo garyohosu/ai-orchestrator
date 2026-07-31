@@ -4,6 +4,8 @@
 
 CLI実行中もmailの公開`find_mails()`で同一送信者・受信者・Job-ID・Decision-IDの通知を非破壊検索する。`WAITING_FOR_DECISION`、`COMPLETED`、`FAILED`、`HUMAN_REQUIRED`、`REJECTED`、`CANCELLED`を検知した場合は、メールIDと状態を記録して短い猶予を与え、自然終了を待つ。自然終了しない場合は既存のWindows安全停止処理を使う。WAITING検知による停止はTIMEOUTに分類せず、Job全体の完了とは分離する。CLI内部タイムアウト、orchestrator監視期限、外側テストハーネス期限の順序を崩してはならない。
 
+各CLIプロセスにはJob-ID・Decision-IDとは別のInvocation-IDを発行する。同一プロセスのACK、WAITING_FOR_DECISION、COMPLETED、FAILEDは同じInvocation-IDでなければならず、再開起動では新しいInvocation-IDを使用する。NO_REPLYは今回の実行でCLIを起動し、PID・プロセス開始時刻・起動前最大メールIDを記録し、同一Job/Decision/Invocationの有効な応答がなく、CLIが終了またはタイムアウトし、起動単位終端通知がない場合だけ送信する。CLI未起動、ACKのみ、WAITING_FOR_DECISION、COMPLETEDではNO_REPLYを送信しない。
+
 ## 1. 概要
 
 本システムは、Windows 11上でPython、PowerShell、SQLiteを用いたメールシステムを使用し、Codex CLI、Claude CodeなどのAIエージェントを必要なときだけ起動する仕組みである。
@@ -671,7 +673,7 @@ HUMAN_REQUIRED
 
 PowerShell、PC、オーケストレーターを再起動しても、SQLiteメール、引継ぎ情報、成果物から未完了作業を確認できるものとする。
 
-CLIの判定は終了コードだけで行わず、起動可否、タイムアウト、返信メールの有無・依頼ID・送受信者UID、AIが返信した状態、およびCLIアダプターがstdout/stderrから抽出した有限長の判定根拠を組み合わせる。CLIを起動できない、CLIが見つからない、または対象プロジェクトが存在しない場合は`DELIVERY_FAILED`、アダプターが利用制限を示す根拠を検出した場合は`RATE_LIMITED`、0以外の終了コードまたは予期せぬ終了は`FAILED`、タイムアウトは`TIMEOUT`、終了コード0かつ返信がない場合は`NO_REPLY`とする。未読メールが0でAIを起動しなかった場合は`NO_WORK`をログに記録する。認証切れ、対象ファイル不足、破壊的操作、人間判断の必要性は、可能な場合はAIからの返信状態を優先し、判定できない場合は`HUMAN_REQUIRED`として停止する。標準出力や標準エラーの単独判定を共通分類器が行ってはならず、CLI固有判定はアダプターが根拠付きで返す。
+CLIの判定は終了コードだけで行わず、起動可否、タイムアウト、返信メールの有無・依頼ID・送受信者UID、AIが返信した状態、およびCLIアダプターがstdout/stderrから抽出した有限長の判定根拠を組み合わせる。CLIを起動できない、CLIが見つからない、または対象プロジェクトが存在しない場合は`DELIVERY_FAILED`、アダプターが利用制限を示す根拠を検出した場合は`RATE_LIMITED`、0以外の終了コードまたは予期せぬ終了は`FAILED`、タイムアウトは`TIMEOUT`、NO_REPLYの条件を満たした場合だけ`NO_REPLY`とする。未読メールが0でAIを起動しなかった場合は`NO_WORK`をログに記録し、NO_REPLYを送信しない。認証切れ、対象ファイル不足、破壊的操作、人間判断の必要性は、可能な場合はAIからの返信状態を優先し、判定できない場合は`HUMAN_REQUIRED`として停止する。標準出力や標準エラーの単独判定を共通分類器が行ってはならず、CLI固有判定はアダプターが根拠付きで返す。
 
 `RATE_LIMITED`は通常のCLI起動失敗再試行を行わず、設定された代替AIへ同じ依頼IDで引き継ぐ。代替AIの選択順、担当履歴、引継ぎ回数、循環防止、候補全滅時の`HUMAN_REQUIRED`遷移は`orchestrator/FAILOVER_DESIGN.md`で定義する。
 

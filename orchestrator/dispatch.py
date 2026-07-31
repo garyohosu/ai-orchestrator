@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import re
 import json
+import uuid
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
@@ -180,6 +181,8 @@ class NotificationDetail:
     handoff_reason: str | None = None
     decision_id: str | None = None
     timeout_sec: int | None = None
+    invocation_id: str = ""
+    launch_started_at: str = ""
 
 
 _UID_PATTERN = re.compile(r"^UID[0-9]{6,}$")
@@ -243,6 +246,8 @@ class ErrorNotifier:
             f"status: {'TIMED_OUT' if status == OutcomeStatus.TIMEOUT else status.value}",
             f"job_id: {job_id}",
             f"decision_id: {detail.decision_id or 'unknown'}",
+            f"invocation_id: {detail.invocation_id or 'unknown'}",
+            f"cli_started_at: {detail.launch_started_at or 'unknown'}",
             f"agent_uid: {detail.target_agent_uid}",
             f"exit_code: {detail.exit_code if detail.exit_code is not None else 'unknown'}",
             f"timeout_sec: {detail.timeout_sec if detail.timeout_sec is not None else 'unknown'}",
@@ -454,6 +459,8 @@ class DispatchCycle:
 
         if process_result is not None and process_result.terminal_status is not None:
             terminal_status = process_result.terminal_status
+            if status == OutcomeStatus.SUCCESS:
+                self._round_trips.increment(job_id)
             self._terminal_store.mark(origin_mail["mail_id"], terminal_status)
             self._checkpoint_store.save(
                 Checkpoint(
@@ -536,6 +543,8 @@ class DispatchCycle:
             classification=self._classification_dict(process_result),
             decision_id=decision_id,
             timeout_sec=self._cli_timeout_sec if status == OutcomeStatus.TIMEOUT else None,
+            invocation_id=getattr(process_result, "invocation_id", ""),
+            launch_started_at=getattr(process_result, "launch_started_at", ""),
         )
         notified = self._notifier.notify(
             job_id, origin_mail["mail_id"], origin_mail["sender_uid"], status, detail
@@ -742,12 +751,17 @@ class DispatchCycle:
         dec_match = re.search(r"\[(DEC-[A-Za-z0-9._-]+)\]", subj)
         if dec_match:
             decision_id = dec_match.group(1)
+        invocation_id = f"INV-{now_iso().replace('-', '').replace(':', '').replace('.', '')}-{attempt:03d}-{uuid.uuid4().hex[:8].upper()}"
+        origin_mail_max_id = max(
+            (int(mail.get("mail_id", 0)) for mail in self._mail.find_mails(limit=None)), default=0
+        )
 
         env_vars = {
             "AGENT_UID": agent.uid,
             "REPLY_TO_UID": origin_mail.get("sender_uid", ""),
             "JOB_ID": job_id,
             "DECISION_ID": decision_id,
+            "INVOCATION_ID": invocation_id,
             "PROJECT_PATH": str(self._project_path),
         }
         if hasattr(self._mail, "_db_path") and getattr(self._mail, "_db_path"):
@@ -756,7 +770,8 @@ class DispatchCycle:
         try:
             try:
                 launched = self._launcher.launch(
-                    agent, job_id, origin_mail["mail_id"], self._project_path, attempt=attempt, env_vars=env_vars
+                    agent, job_id, origin_mail["mail_id"], self._project_path,
+                    attempt=attempt, env_vars=env_vars, invocation_id=invocation_id
                 )
             except TypeError as err:
                 # Preserve compatibility with test/dedicated launchers that
@@ -780,6 +795,9 @@ class DispatchCycle:
             agent_uid=agent.uid,
             job_id=job_id,
             origin_mail_id=origin_mail["mail_id"],
+            invocation_id=invocation_id,
+            origin_mail_max_id=origin_mail_max_id,
+            decision_id=decision_id,
             launch_command=redacted_command,
             recorded_at_iso=launched.launched_at_iso,
             retry_count=attempt - 1,
@@ -800,7 +818,7 @@ class DispatchCycle:
         try:
             process_result = launched.wait(
                 self._cli_timeout_sec,
-                terminal_reply_check=self._terminal_reply_checker(agent, origin_mail, job_id),
+                terminal_reply_check=self._terminal_reply_checker(agent, origin_mail, job_id, invocation_id, origin_mail_max_id),
                 poll_interval_sec=self._terminal_poll_interval_sec,
                 terminal_grace_sec=self._terminal_grace_sec,
             )
@@ -829,6 +847,8 @@ class DispatchCycle:
                 stderr_tail=stderr_artifact.tail if stderr_artifact else "",
                 stdout_artifact=stdout_artifact.as_dict() if stdout_artifact else None,
                 stderr_artifact=stderr_artifact.as_dict() if stderr_artifact else None,
+                invocation_id=invocation_id,
+                launch_started_at=launched.launched_at_iso,
             )
             notified = self._notifier.notify(
                 job_id, origin_mail["mail_id"], origin_mail["sender_uid"],
@@ -875,8 +895,11 @@ class DispatchCycle:
                 recipient_uid=reply_to_uid,
                 origin_mail_id=origin_mail["mail_id"],
                 not_before_iso=not_before,
+                invocation_id=invocation_id,
+                max_mail_id=origin_mail_max_id,
+                decision_id=decision_id,
             )
-            reply_result = self._reply_verifier.wait_for_reply(
+            reply_result = self._reply_verifier.wait_for_terminal_reply(
                 expected, self._reply_check_timeout_sec
             )
             reply_found = reply_result.found
@@ -895,37 +918,18 @@ class DispatchCycle:
             )
         return status, process_result
 
-    def _terminal_reply_checker(self, agent: AgentDefinition, origin_mail: dict, job_id: str):
+    def _terminal_reply_checker(self, agent: AgentDefinition, origin_mail: dict, job_id: str, invocation_id: str, origin_mail_max_id: int):
         reply_to_uid = resolve_reply_to_uid(self._mail, origin_mail)
-        decision_match = _DECISION_ID_PATTERN.search(origin_mail.get("subject", ""))
-        decision_id = decision_match.group(1) if decision_match else None
         not_before = shift_ms(origin_mail.get("sent_at", now_iso()), -1)
 
         def check():
-            matches = self._mail.find_mails(
-                sender_uid=agent.uid, recipient_uid=reply_to_uid, request_id=job_id,
-                after_mail_id=origin_mail["mail_id"], sent_after=not_before, limit=20,
-            )
-            for message in matches:
-                subject = message.get("subject", "")
-                body = message.get("body", "")
-                dec_match = _DECISION_ID_PATTERN.search(subject)
-                if decision_id != (dec_match.group(1) if dec_match else None):
-                    continue
-                status = None
-                try:
-                    payload = json.loads(body)
-                    status = payload.get("status") if isinstance(payload, dict) else None
-                except (TypeError, json.JSONDecodeError):
-                    pass
-                if status not in {"WAITING_FOR_DECISION", "COMPLETED", "FAILED", "HUMAN_REQUIRED", "REJECTED", "CANCELLED"}:
-                    for candidate in ("WAITING_FOR_DECISION", "COMPLETED", "HUMAN_REQUIRED", "REJECTED", "CANCELLED", "FAILED"):
-                        if candidate in subject or f"status: {candidate}" in body:
-                            status = candidate
-                            break
-                if status in {"WAITING_FOR_DECISION", "COMPLETED", "FAILED", "HUMAN_REQUIRED", "REJECTED", "CANCELLED"}:
-                    return status, int(message["mail_id"])
-            return None
+            result = self._reply_query.find_terminal_reply(ExpectedReply(
+                job_id=job_id, sender_uid=agent.uid, recipient_uid=reply_to_uid,
+                origin_mail_id=origin_mail["mail_id"], not_before_iso=not_before,
+                invocation_id=invocation_id, max_mail_id=origin_mail_max_id,
+                decision_id=_DECISION_ID_PATTERN.search(origin_mail.get("subject", "")).group(1) if _DECISION_ID_PATTERN.search(origin_mail.get("subject", "")) else "",
+            ))
+            return (result.status, result.reply_mail_id) if result.found else None
         return check
 
     def _finalize_without_notify(

@@ -64,6 +64,16 @@ class CliLauncherTests(unittest.TestCase):
         self.assertEqual(result.exit_code, 0)
         self.assertFalse(result.timed_out)
 
+    def test_each_cli_launch_carries_a_distinct_invocation_id(self) -> None:
+        launcher = self._launcher_for("exit_success.py")
+        first = launcher.launch(self._agent("exit_success.py"), "JOB-1", 1, self.project_path, invocation_id="INV-1")
+        second = launcher.launch(self._agent("exit_success.py"), "JOB-1", 2, self.project_path, invocation_id="INV-2")
+        self.assertEqual(first.invocation_id, "INV-1")
+        self.assertEqual(second.invocation_id, "INV-2")
+        self.assertNotEqual(first.invocation_id, second.invocation_id)
+        self.assertEqual(first.wait(timeout_sec=10).exit_code, 0)
+        self.assertEqual(second.wait(timeout_sec=10).exit_code, 0)
+
     def test_failure_process_reports_nonzero_exit_code(self) -> None:
         launcher = self._launcher_for("exit_fail.py")
         launched = launcher.launch(self._agent("exit_fail.py"), "JOB-1", 1, self.project_path)

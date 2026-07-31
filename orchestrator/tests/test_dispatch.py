@@ -70,9 +70,11 @@ class DispatchCycleHarness:
         """
         original_launch = self.cycle._launcher.launch
 
-        def patched_launch(agent, job_id, origin_mail_id, project_path):
-            launched = original_launch(agent, job_id, origin_mail_id, project_path)
-            self.mail.send_mail(sender_uid, recipient_uid, subject, body)
+        def patched_launch(agent, job_id, origin_mail_id, project_path, **kwargs):
+            launched = original_launch(agent, job_id, origin_mail_id, project_path, **kwargs)
+            status = "WAITING_FOR_DECISION" if "WAITING_FOR_DECISION" in subject else ("ACK_RECEIVED" if "ACK" in subject else "COMPLETED")
+            payload = {"status": status, "job_id": job_id, "invocation_id": launched.invocation_id}
+            self.mail.send_mail(sender_uid, recipient_uid, f"{subject} [{launched.invocation_id}]", json.dumps(payload))
             return launched
 
         self.cycle._launcher.launch = patched_launch
@@ -177,6 +179,16 @@ class NoWorkAndOrderingTests(unittest.TestCase):
         agent = _agent("worker", worker, "exit_success.py")
         outcomes = h.cycle.run_one_pass([agent])
         self.assertEqual(outcomes, [])
+        self.assertEqual(h.mail.send_mail_calls, 0)
+
+    def test_ack_only_is_not_a_terminal_reply(self) -> None:
+        h = DispatchCycleHarness(max_retries=0)
+        commander = h.mail.register_user("commander")
+        worker = h.mail.register_user("worker")
+        h.mail.send_mail(commander, worker, "[JOB-A] 依頼", "b")
+        h.reply_after_launch(worker, commander, "[JOB-A] STATUS: ACK", "ack")
+        outcome = h.cycle.run_one_pass([_agent("worker", worker, "exit_success.py")])[0]
+        self.assertEqual(outcome.status, OutcomeStatus.NO_REPLY)
 
     def test_agents_processed_in_config_order_not_registration_order(self) -> None:
         h = DispatchCycleHarness()
@@ -308,9 +320,11 @@ class SuccessAndReplyMatchingTests(unittest.TestCase):
         # process (which just exits 0) is even waited on.
         original_launch = h.cycle._launcher.launch
 
-        def patched_launch(agent, job_id, origin_mail_id, project_path):
-            launched = original_launch(agent, job_id, origin_mail_id, project_path)
+        def patched_launch(agent, job_id, origin_mail_id, project_path, **kwargs):
+            launched = original_launch(agent, job_id, origin_mail_id, project_path, **kwargs)
             reply_id = h.mail.send_mail(worker, commander, "[JOB-A] 完了報告", "done")
+            h.mail._mails[-1]["subject"] += f" [{launched.invocation_id}]"
+            h.mail._mails[-1]["body"] = json.dumps({"status": "COMPLETED", "job_id": job_id, "invocation_id": launched.invocation_id})
             h.mail.seed_sent_at(reply_id, launched.launched_at_iso)
             return launched
 
@@ -410,9 +424,11 @@ class NotificationTests(unittest.TestCase):
         agent = _agent("worker", worker, "exit_fail.py")
         h.cycle.run_one_pass([agent])
         notification = h.mail._mails[-1]
+        self.assertEqual(notification["recipient_uid"], commander)
         for label in (
             "status:", "job_id:", "decision_id:", "agent_uid:", "exit_code:", "timeout_sec:",
             "stdout_log:", "stderr_log:", "occurred_at:",
+            "invocation_id:", "cli_started_at:",
             "状態:", "依頼ID:", "元メールID:", "元の送信者UID:", "処理対象AI:",
             "処理対象UID:", "失敗段階:", "失敗理由:", "CLI終了コード:", "実行時間:",
             "再試行回数:", "最終試行日時:", "元メールの状態:", "推奨する次の対応:",

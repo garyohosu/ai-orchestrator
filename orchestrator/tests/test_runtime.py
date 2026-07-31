@@ -173,6 +173,8 @@ class StaleRecoveryServiceTests(unittest.TestCase):
                 launch_command=["x"],
                 recorded_at_iso=now_iso(),
                 retry_count=0,
+                invocation_id="INV-TEST-001",
+                origin_mail_max_id=origin_mail_id,
             )
         )
 
@@ -215,7 +217,7 @@ class StaleRecoveryServiceTests(unittest.TestCase):
         # agent replies. Reversing this order would make find_reply's
         # sent_after check reject the reply, defeating the test.
         self._save_state(pid=999_999, start_time="2000-01-01T00:00:00.000Z", origin_mail_id=origin_id)
-        self.mail.send_mail(self.worker, self.commander, "[JOB-A] 完了報告", "done")
+        self.mail.send_mail(self.worker, self.commander, "[JOB-A] [INV-TEST-001] 完了報告", '{"status":"COMPLETED","job_id":"JOB-A","invocation_id":"INV-TEST-001"}')
         actions = self.service.recover_on_startup()
         self.assertEqual(actions[0].kind, RecoveryActionKind.MARK_COMPLETED)
 

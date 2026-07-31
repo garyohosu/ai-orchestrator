@@ -168,6 +168,21 @@ class MailReplyQueryTests(unittest.TestCase):
         self.assertEqual(before, after)
         self.assertEqual(self.mail.receive_mail_calls, 0)
 
+    def test_terminal_reply_requires_matching_invocation_and_status(self) -> None:
+        origin_id = self.mail.send_mail(self.commander, self.worker, "[JOB-A] [DEC-1] 依頼", "b")
+        self.mail.send_mail(self.worker, self.commander, "[JOB-A] [DEC-1] [INV-OLD] STATUS: COMPLETED", '{"status":"COMPLETED","invocation_id":"INV-OLD"}')
+        self.mail.send_mail(self.worker, self.commander, "[JOB-A] [DEC-1] [INV-NEW] STATUS: ACK", '{"status":"ACK_RECEIVED","invocation_id":"INV-NEW"}')
+        expected = ExpectedReply(
+            job_id="JOB-A", sender_uid=self.worker, recipient_uid=self.commander,
+            origin_mail_id=origin_id, not_before_iso=shift_ms(now_iso(), -60_000),
+            invocation_id="INV-NEW", max_mail_id=origin_id, decision_id="DEC-1",
+        )
+        self.assertFalse(self.query.find_terminal_reply(expected).found)
+        completed_id = self.mail.send_mail(self.worker, self.commander, "[JOB-A] [DEC-1] [INV-NEW] STATUS: COMPLETED", '{"status":"COMPLETED","invocation_id":"INV-NEW"}')
+        result = self.query.find_terminal_reply(expected)
+        self.assertTrue(result.found)
+        self.assertEqual(result.reply_mail_id, completed_id)
+
 
 class ReplyVerifierTests(unittest.TestCase):
     def test_returns_immediately_when_reply_already_present(self) -> None:

@@ -33,6 +33,9 @@ class RunningAgentState:
     launch_command: list[str]
     recorded_at_iso: str
     retry_count: int = 0
+    invocation_id: str = ""
+    origin_mail_max_id: int = 0
+    decision_id: str = ""
 
     def to_dict(self) -> dict:
         return {
@@ -45,6 +48,9 @@ class RunningAgentState:
             "launch_command": self.launch_command,
             "recorded_at_iso": self.recorded_at_iso,
             "retry_count": self.retry_count,
+            "invocation_id": self.invocation_id,
+            "origin_mail_max_id": self.origin_mail_max_id,
+            "decision_id": self.decision_id,
         }
 
     @classmethod
@@ -59,6 +65,9 @@ class RunningAgentState:
             launch_command=list(data["launch_command"]),
             recorded_at_iso=data["recorded_at_iso"],
             retry_count=int(data.get("retry_count", 0)),
+            invocation_id=str(data.get("invocation_id", "")),
+            origin_mail_max_id=int(data.get("origin_mail_max_id", 0)),
+            decision_id=str(data.get("decision_id", "")),
         )
 
 
@@ -241,8 +250,11 @@ class StaleRecoveryService:
             # is strict, so a reply landing in the same millisecond as the
             # recorded launch would otherwise be spuriously excluded.
             not_before_iso=shift_ms(state.recorded_at_iso, -1),
+            invocation_id=state.invocation_id,
+            max_mail_id=state.origin_mail_max_id or state.origin_mail_id,
+            decision_id=state.decision_id,
         )
-        reply = self._query.find_reply(expected)
+        reply = self._query.find_terminal_reply(expected)
         if reply.found:
             return RecoveryAction(
                 kind=RecoveryActionKind.MARK_COMPLETED,

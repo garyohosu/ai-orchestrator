@@ -138,12 +138,16 @@ class ExpectedReply:
     recipient_uid: str
     origin_mail_id: int
     not_before_iso: str
+    invocation_id: str = ""
+    max_mail_id: int | None = None
+    decision_id: str = ""
 
 
 @dataclass(frozen=True)
 class ReplyCheckResult:
     found: bool
     reply_mail_id: int | None = None
+    status: str | None = None
 
 
 class MailReplyQuery:
@@ -168,6 +172,41 @@ class MailReplyQuery:
         if matches:
             return ReplyCheckResult(found=True, reply_mail_id=matches[0]["mail_id"])
         return ReplyCheckResult(found=False)
+
+    @staticmethod
+    def _invocation_matches(message: dict, invocation_id: str) -> bool:
+        return not invocation_id or invocation_id in (message.get("subject", "") + "\n" + message.get("body", ""))
+
+    def find_terminal_reply(self, expected: ExpectedReply) -> ReplyCheckResult:
+        matches = self._mail.find_mails(
+            sender_uid=expected.sender_uid,
+            recipient_uid=expected.recipient_uid,
+            request_id=expected.job_id,
+            after_mail_id=expected.max_mail_id if expected.max_mail_id is not None else expected.origin_mail_id,
+            sent_after=expected.not_before_iso,
+            limit=None,
+        )
+        terminal = {"WAITING_FOR_DECISION", "COMPLETED", "FAILED", "HUMAN_REQUIRED", "REJECTED", "CANCELLED"}
+        import json
+        for message in matches:
+            if not self._invocation_matches(message, expected.invocation_id):
+                continue
+            if expected.decision_id and expected.decision_id not in (message.get("subject", "") + "\n" + message.get("body", "")):
+                continue
+            status = None
+            try:
+                payload = json.loads(message.get("body", ""))
+                if isinstance(payload, dict):
+                    status = payload.get("status")
+            except (TypeError, ValueError):
+                pass
+            if status not in terminal:
+                subject = message.get("subject", "")
+                body = message.get("body", "")
+                status = next((candidate for candidate in terminal if candidate in subject or f"status: {candidate}" in body), None)
+            if status in terminal:
+                return ReplyCheckResult(True, int(message["mail_id"]), status)
+        return ReplyCheckResult(False)
 
     def get_origin_mail_state(self, mail_id: int, recipient_uid: str) -> dict | None:
         """Return the origin mail's own row (is_read/read_at/body/sender_uid).
@@ -235,6 +274,22 @@ class ReplyVerifier:
         deadline = now_fn() + timeout_sec
         while True:
             result = self._query.find_reply(expected)
+            if result.found:
+                return result
+            remaining = deadline - now_fn()
+            if remaining <= 0:
+                return result
+            sleep_fn(min(1.0, remaining))
+
+    def wait_for_terminal_reply(
+        self, expected: ExpectedReply, timeout_sec: float, sleep_fn: Any = None, now_fn: Any = None
+    ) -> ReplyCheckResult:
+        import time
+        sleep_fn = sleep_fn or time.sleep
+        now_fn = now_fn or time.monotonic
+        deadline = now_fn() + timeout_sec
+        while True:
+            result = self._query.find_terminal_reply(expected)
             if result.found:
                 return result
             remaining = deadline - now_fn()

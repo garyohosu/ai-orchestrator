@@ -106,6 +106,8 @@ class ProcessResult:
     cli_evidence: CliEvidence = CliEvidence()
     terminal_status: str | None = None
     terminal_mail_id: int | None = None
+    invocation_id: str = ""
+    launch_started_at: str = ""
 
 
 class LaunchedProcess:
@@ -121,6 +123,7 @@ class LaunchedProcess:
         adapter: CliAdapter,
         stdout_capture: StreamCapture,
         stderr_capture: StreamCapture,
+        invocation_id: str = "",
     ) -> None:
         self._popen = popen
         self.pid = popen.pid
@@ -133,6 +136,7 @@ class LaunchedProcess:
         self._adapter = adapter
         self._stdout_capture = stdout_capture
         self._stderr_capture = stderr_capture
+        self.invocation_id = invocation_id
         self._capture_threads: list[threading.Thread] = []
         self._capture_started = False
 
@@ -249,6 +253,8 @@ class LaunchedProcess:
             cli_evidence=evidence,
             terminal_status=terminal_status,
             terminal_mail_id=terminal_mail_id,
+            invocation_id=self.invocation_id,
+            launch_started_at=self.launched_at_iso,
         )
 
     def terminate(self) -> None:
@@ -275,7 +281,7 @@ class CliLauncher:
 
     def launch(
         self, agent: AgentDefinition, job_id: str, origin_mail_id: int, project_path: Path,
-        attempt: int = 1, env_vars: dict[str, str] | None = None,
+        attempt: int = 1, env_vars: dict[str, str] | None = None, invocation_id: str = "",
     ) -> LaunchedProcess:
         command = self._resolver.resolve(agent)
         adapter = self._adapters[agent.cli_type]
@@ -337,6 +343,7 @@ class CliLauncher:
             adapter=adapter,
             stdout_capture=stdout_capture,
             stderr_capture=stderr_capture,
+            invocation_id=invocation_id,
         )
         # Start drainers before returning so a fast CLI cannot fill a pipe
         # during the caller's small gap before wait().
