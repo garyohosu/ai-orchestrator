@@ -72,7 +72,7 @@ class DispatchCycleHarness:
 
         def patched_launch(agent, job_id, origin_mail_id, project_path, **kwargs):
             launched = original_launch(agent, job_id, origin_mail_id, project_path, **kwargs)
-            status = "WAITING_FOR_DECISION" if "WAITING_FOR_DECISION" in subject else ("ACK_RECEIVED" if "ACK" in subject else "COMPLETED")
+            status = "WAITING_FOR_WORKER" if "WAITING_FOR_WORKER" in subject else ("WAITING_FOR_DECISION" if "WAITING_FOR_DECISION" in subject else ("ACK_RECEIVED" if "ACK" in subject else "COMPLETED"))
             payload = {"status": status, "job_id": job_id, "invocation_id": launched.invocation_id}
             self.mail.send_mail(sender_uid, recipient_uid, f"{subject} [{launched.invocation_id}]", json.dumps(payload))
             return launched
@@ -390,6 +390,21 @@ class FailureClassificationTests(unittest.TestCase):
         outcomes = h.cycle.run_one_pass([agent])
         self.assertEqual(outcomes[0].status, OutcomeStatus.SUCCESS)
         self.assertFalse(any("TIMEOUT" in mail["subject"] for mail in h.mail._mails))
+
+    def test_waiting_for_worker_terminal_mail_stops_running_cli_without_timeout(self) -> None:
+        h = DispatchCycleHarness(max_retries=0)
+        commander = h.mail.register_user("commander")
+        director = h.mail.register_user("director")
+        h.mail.send_mail(commander, director, "[JOB-A] [DEC-1] 依頼", "b")
+        h.reply_after_launch(
+            director, commander, "[JOB-A] [DEC-1] STATUS: WAITING_FOR_WORKER",
+            json.dumps({"status": "WAITING_FOR_WORKER", "job_id": "JOB-A", "decision_id": "DEC-1"}),
+        )
+        agent = _agent("director", director, "sleep_forever.py")
+        h.cycle._cli_timeout_sec = 3
+        outcomes = h.cycle.run_one_pass([agent])
+        self.assertEqual(outcomes[0].status, OutcomeStatus.SUCCESS)
+        self.assertFalse(any("NO_REPLY" in mail["subject"] for mail in h.mail._mails))
 
     def test_delivery_failed_retries_up_to_max_then_notifies(self) -> None:
         h = DispatchCycleHarness(max_retries=2)

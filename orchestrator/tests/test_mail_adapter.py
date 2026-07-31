@@ -183,6 +183,18 @@ class MailReplyQueryTests(unittest.TestCase):
         self.assertTrue(result.found)
         self.assertEqual(result.reply_mail_id, completed_id)
 
+    def test_waiting_for_worker_is_a_terminal_invocation_status(self) -> None:
+        origin_id = self.mail.send_mail(self.commander, self.worker, "[JOB-A] [DEC-1] request", "b")
+        self.mail.send_mail(self.worker, self.commander, "[JOB-A] [DEC-1] [INV-1] STATUS: WAITING_FOR_WORKER", '{"status":"WAITING_FOR_WORKER","job_id":"JOB-A","decision_id":"DEC-1","invocation_id":"INV-1"}')
+        expected = ExpectedReply(
+            job_id="JOB-A", sender_uid=self.worker, recipient_uid=self.commander,
+            origin_mail_id=origin_id, not_before_iso=shift_ms(now_iso(), -60_000),
+            invocation_id="INV-1", max_mail_id=origin_id, decision_id="DEC-1",
+        )
+        result = self.query.find_terminal_reply(expected)
+        self.assertTrue(result.found)
+        self.assertEqual(result.status, "WAITING_FOR_WORKER")
+
 
 class ReplyVerifierTests(unittest.TestCase):
     def test_returns_immediately_when_reply_already_present(self) -> None:

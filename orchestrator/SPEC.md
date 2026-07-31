@@ -2,9 +2,9 @@
 
 ## 1.1 起動単位の終端通知監視
 
-CLI実行中もmailの公開`find_mails()`で同一送信者・受信者・Job-ID・Decision-IDの通知を非破壊検索する。`WAITING_FOR_DECISION`、`COMPLETED`、`FAILED`、`HUMAN_REQUIRED`、`REJECTED`、`CANCELLED`を検知した場合は、メールIDと状態を記録して短い猶予を与え、自然終了を待つ。自然終了しない場合は既存のWindows安全停止処理を使う。WAITING検知による停止はTIMEOUTに分類せず、Job全体の完了とは分離する。CLI内部タイムアウト、orchestrator監視期限、外側テストハーネス期限の順序を崩してはならない。
+CLI実行中もmailの公開`find_mails()`で同一送信者・受信者・Job-ID・Decision-IDの通知を非破壊検索する。`WAITING_FOR_DECISION`、`WAITING_FOR_WORKER`、`COMPLETED`、`FAILED`、`HUMAN_REQUIRED`、`REJECTED`、`CANCELLED`を検知した場合は、メールIDと状態を記録して短い猶予を与え、自然終了を待つ。自然終了しない場合は既存のWindows安全停止処理を使う。WAITING検知による停止はTIMEOUTに分類せず、Job全体の完了とは分離する。CLI内部タイムアウト、orchestrator監視期限、外側テストハーネス期限の順序を崩してはならない。
 
-各CLIプロセスにはJob-ID・Decision-IDとは別のInvocation-IDを発行する。同一プロセスのACK、WAITING_FOR_DECISION、COMPLETED、FAILEDは同じInvocation-IDでなければならず、再開起動では新しいInvocation-IDを使用する。NO_REPLYは今回の実行でCLIを起動し、PID・プロセス開始時刻・起動前最大メールIDを記録し、同一Job/Decision/Invocationの有効な応答がなく、CLIが終了またはタイムアウトし、起動単位終端通知がない場合だけ送信する。CLI未起動、ACKのみ、WAITING_FOR_DECISION、COMPLETEDではNO_REPLYを送信しない。
+各CLIプロセスにはJob-ID・Decision-IDとは別のInvocation-IDを発行する。同一プロセスのACK、WAITING_FOR_DECISION、WAITING_FOR_WORKER、COMPLETED、FAILEDは同じInvocation-IDでなければならず、再開起動では新しいInvocation-IDを使用する。NO_REPLYは今回の実行でCLIを起動し、PID・プロセス開始時刻・起動前最大メールIDを記録し、同一Job/Decision/Invocationの有効な応答がなく、CLIが終了またはタイムアウトし、起動単位終端通知がない場合だけ送信する。CLI未起動、ACKのみ、WAITING_FOR_DECISION、WAITING_FOR_WORKER、COMPLETEDではNO_REPLYを送信しない。
 
 ## 1. 概要
 

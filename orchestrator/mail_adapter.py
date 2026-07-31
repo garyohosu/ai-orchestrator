@@ -188,7 +188,7 @@ class MailReplyQuery:
             sent_after=expected.not_before_iso,
             limit=None,
         )
-        terminal = {"WAITING_FOR_DECISION", "COMPLETED", "FAILED", "HUMAN_REQUIRED", "REJECTED", "CANCELLED"}
+        terminal = {"WAITING_FOR_DECISION", "WAITING_FOR_WORKER", "COMPLETED", "FAILED", "HUMAN_REQUIRED", "REJECTED", "CANCELLED"}
         import json
         for message in matches:
             if not self._invocation_matches(message, expected.invocation_id):

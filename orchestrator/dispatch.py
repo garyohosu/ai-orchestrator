@@ -467,7 +467,7 @@ class DispatchCycle:
                     job_id=job_id,
                     purpose=origin_mail["subject"],
                     current_state=terminal_status,
-                    next_actions=["directorへ次の処理を委任" if terminal_status == "WAITING_FOR_DECISION" else "終端状態を保持"],
+                    next_actions=["workerの応答を待機" if terminal_status == "WAITING_FOR_WORKER" else ("directorへ次の処理を委任" if terminal_status == "WAITING_FOR_DECISION" else "終端状態を保持")],
                 )
             )
             self._logger.log_outcome(
@@ -905,7 +905,7 @@ class DispatchCycle:
             reply_found = reply_result.found
 
         terminal_status = process_result.terminal_status
-        if terminal_status in {"WAITING_FOR_DECISION", "COMPLETED"}:
+        if terminal_status in {"WAITING_FOR_DECISION", "WAITING_FOR_WORKER", "COMPLETED"}:
             status = OutcomeStatus.SUCCESS
             reply_found = True
         elif terminal_status == "HUMAN_REQUIRED":
