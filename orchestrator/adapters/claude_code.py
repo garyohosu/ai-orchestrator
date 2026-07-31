@@ -11,6 +11,9 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from adapters.base import CliEvidence
+from output_capture import OutputArtifact
+
 
 class ClaudeCodeCliAdapter:
     cli_type = "claude_code"
@@ -22,3 +25,23 @@ class ClaudeCodeCliAdapter:
         # "-p" (print mode) runs one non-interactive turn and exits; the
         # fixed instruction is delivered via stdin by the launcher.
         return [*command, "-p"]
+
+    def classify_output(
+        self,
+        exit_code: int | None,
+        timed_out: bool,
+        stdout: OutputArtifact,
+        stderr: OutputArtifact,
+    ) -> CliEvidence:
+        # Claude Code 2.1.220 observed message. The reset time and timezone
+        # are intentionally not part of the rule.
+        needle = "you've hit your session limit"
+        for stream_name, artifact in (("stdout", stdout), ("stderr", stderr)):
+            if needle in artifact.tail.lower():
+                return CliEvidence(
+                    rate_limited=True,
+                    rule_id="claude.rate_limit.session_limit",
+                    stream=stream_name,
+                    evidence="You've hit your session limit",
+                )
+        return CliEvidence()

@@ -27,6 +27,9 @@ classDiagram
         +max_round_trips: int
         +max_retries: int
         +max_run_duration_sec: int
+        +cli_output_max_bytes: int
+        +notification_tail_bytes: int
+        +max_handoffs: int
         +agents: list~AgentDefinition~
         +project_path: str
         +logs_dir: str
@@ -40,6 +43,7 @@ classDiagram
         +uid: str
         +command: list~str~
         +order_index: int
+        +fallback_agents: list~str~
     }
 
     class MailWatcher {
@@ -85,6 +89,29 @@ classDiagram
         +exit_code: int
         +timed_out: bool
         +duration_sec: float
+        +stdout_artifact: OutputArtifact
+        +stderr_artifact: OutputArtifact
+        +cli_evidence: CliEvidence
+    }
+
+    class OutputPump {
+        +stream_to_file(stream, path, max_bytes) OutputArtifact
+        -redact_chunk(chunk) bytes
+    }
+
+    class OutputArtifact {
+        +relative_path: str
+        +sha256: str
+        +saved_bytes: int
+        +truncated: bool
+        +tail: str
+    }
+
+    class CliEvidence {
+        +rate_limited: bool
+        +rule_id: str
+        +stream: str
+        +evidence: str
     }
 
     class MailReplyQuery {
@@ -136,6 +163,7 @@ classDiagram
         NO_WORK
         DELIVERY_FAILED
         FAILED
+        RATE_LIMITED
         TIMEOUT
         NO_REPLY
         HUMAN_REQUIRED
@@ -219,6 +247,21 @@ classDiagram
         +open_issues: list~str~
         +next_actions: list~str~
         +updated_at: datetime
+        +handoff_count: int
+        +visited_agents: list~str~
+        +handoff_history: list~HandoffRecord~
+    }
+
+    class HandoffRecord {
+        +from_agent: str
+        +to_agent: str
+        +reason: str
+        +at: datetime
+        +classification_rule: str
+    }
+
+    class HandoffSelector {
+        +select(current_agent: str, checkpoint: Checkpoint) AgentDefinition
     }
 
     class JobLogger {
@@ -273,6 +316,11 @@ classDiagram
     DispatchCycle --> CheckpointStore
     DispatchCycle --> RuntimeStateStore
     DispatchCycle --> RoundTripCounter
+    DispatchCycle --> HandoffSelector
+    CliLauncher --> OutputPump
+    OutputPump --> OutputArtifact
+    OutcomeClassifier --> CliEvidence
+    HandoffSelector --> Checkpoint
     MailWatcher --> MailModuleAdapter
     ErrorNotifier --> MailModuleAdapter
     ErrorNotifier --> NotificationDetail
@@ -304,17 +352,20 @@ classDiagram
 | `MailWatcher` | `check_mail`による未読監視、エージェント定義順・メールID昇順の走査 | 15章, 16章 |
 | `MailModuleAdapter` | `mail`パッケージ関数（`register_user` / `list_users` / `send_mail` / `check_mail` / `receive_mail` / `find_mails`）への薄いラッパー。`mail`への唯一の依存境界 | 7章 |
 | `CliLauncher` / `CliPathResolver` | CLI検出順（config→PATH→既定名）、`subprocess`によるコマンド・引数分離起動、固定指示の生成、UTF-8環境変数の設定 | 11章, 12章, 21章 |
-| `LaunchedProcess` / `ProcessResult` | 起動済みプロセスの待機・終了コード・タイムアウト検出 | 12章, 15章 |
+| `OutputPump` / `OutputArtifact` | stdout/stderrを個別ファイルへ上限付きストリーミング保存し、パイプを drain しながらマスキング・末尾・SHA-256を生成 | 23章, FAILOVER_DESIGN.md |
+| `CliAdapter` / `CliEvidence` | CLI固有のstdout/stderr特徴から利用制限を根拠付き判定。共通分類器へ生出力を渡さない | 11章, 26章 |
+| `LaunchedProcess` / `ProcessResult` | 起動済みプロセスの待機・終了コード・タイムアウト検出と出力成果物の受け渡し | 12章, 15章 |
 | `MailReplyQuery` | `MailModuleAdapter.find_mails`を用いた、既読状態を変更しない参照。返信照合条件（送受信者UID・依頼ID・元メールID超過・CLI起動後）を`find_mails`の引数へ組み立てる。DBへ直接アクセスしない | 7章, 24章, 30章「返信メールの確認」 |
 | `ReplyVerifier` / `ExpectedReply` / `ReplyCheckResult` | 返信確認タイムアウト内での返信メール照合（送受信者UID・依頼ID・メールID・作成時刻） | 30章「返信メールの確認」 |
 | `RoundTripCounter` | 依頼ID単位の往復回数の計数と`最大往復回数`到達判定。完了報告・エラー通知・受領通知は計数しない | 10章, 25章 |
 | `RunDurationGuard` | 常時監視モードの`最大連続実行時間`監視と安全停止判定（0のときだけ無期限） | 10章, 14章 |
-| `OutcomeClassifier` / `OutcomeStatus` | 起動可否・終了コード・タイムアウト・返信有無から状態を確定 | 26章, 30章 |
+| `OutcomeClassifier` / `OutcomeStatus` | 起動可否・終了コード・タイムアウト・返信有無・`CliEvidence`から状態を確定 | 26章, 30章 |
 | `RetryPolicy` | 未受信が明らかな場合のみ最大再試行回数まで再試行を許可 | 10章, 26章 |
 | `ErrorNotifier` / `NotificationDetail` | システム送信者としてのエラー通知作成、秘密情報除去、再帰通知防止 | 30章 |
 | `RuntimeStateStore` / `RunningAgentState` | `runtime/`への実行中情報の保存・照会、`stop.request`の読み取り | 24章 |
 | `StaleRecoveryService` / `RecoveryAction` | 起動時のSTALE判定とPID+開始時刻照合、再処理・通知・完了整理への振り分け | 24章 |
 | `CheckpointStore` / `Checkpoint` | `checkpoints/`への引継ぎ情報の保存・読込 | 20章 |
+| `HandoffSelector` / `HandoffRecord` | `fallback_agents`の順序、訪問済み担当、引継ぎ上限を検査し、循環を防いで代替AIを選ぶ | 20章, 26章 |
 | `JobLogger` / `LogEntry` | `logs/`への実行記録、秘密情報を含めない | 23章 |
 | `DispatchCycle` | 1エージェント分の「監視→起動→待機→判定→再試行/通知→ログ→引継ぎ更新」の一連処理を束ねる | 15章, 16章 |
 

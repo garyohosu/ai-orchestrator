@@ -70,6 +70,10 @@ project-root/
   "logs_dir": "logs",
   "checkpoints_dir": "checkpoints",
   "runtime_dir": "runtime",
+  "cli_output_max_bytes": 1048576,
+  "cli_output_ring_bytes": 65536,
+  "notification_tail_bytes": 8192,
+  "max_handoffs": 3,
   "agents": [
     { "name": "commander", "uid": "UID000001", "cli_type": "codex", "command": [] },
     { "name": "worker", "uid": "UID000002", "cli_type": "claude_code", "command": [] }
@@ -81,6 +85,8 @@ project-root/
 - `agents[].cli_type`は`"codex"`または`"claude_code"`のいずれかです。
 - `agents[].command`を空配列のままにすると、CLIは次の順で自動検出されます: (1) `command`に明示されたコマンド, (2) WindowsのPATH上の既定コマンド名（`codex`/`claude`）。特別な起動フラグが必要な環境では、`command`に完全なコマンド配列（例: `["C:\\tools\\claude.exe", "-p", "--dangerously-skip-permissions"]`）を明示してください。
 - `agents`の並び順がAIの処理順になります（登録UID順ではありません）。
+- `agents[].fallback_agents`にはRATE_LIMITED時の代替AI名を順序付きで指定できます。訪問済みAI、引継ぎ上限、二重送信は依頼ID単位で管理されます。
+- `cli_output_max_bytes`（既定1 MiB）はstdout/stderr各証跡ファイルの上限、`cli_output_ring_bytes`（既定64 KiB）は判定用末尾リングバッファ、`notification_tail_bytes`（既定8 KiB）は通知掲載量、`max_handoffs`（既定3）は依頼ID単位の自動引継ぎ上限です。
 - `project_path`を省略すると、対象プロジェクトは`project-root`（`orchestrator`の親ディレクトリ）になります。指定する場合は`project-root`を基準とした相対パスとし、正規化後に`project-root`の外へ出る指定は拒否されます。
 - APIキー・パスワード・認証トークンを`config.json`へ書いてはいけません。
 

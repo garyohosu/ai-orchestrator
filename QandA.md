@@ -135,6 +135,41 @@ SPEC.mdのレビューで確認が必要な事項を記録する。
 
 補足: `find_mails`の**実装**（`mail/agent_mail.py`・`mail/__init__.py`・`mail/tests/test_agent_mail.py`）は未着手である。仕様・API文書・試験要件のみを確定した段階であり、オーケストレーター実装の前に`mail`側の実装が必要となる。
 
+## Q014
+
+- 状態: ANSWERED
+- 重要度: 高
+- 質問者: Codex
+- 対象ファイル: orchestrator/FAILOVER_DESIGN.md, orchestrator/SPEC.md
+- 質問内容: Claude Code、Codexなど各CLIが利用制限時に出力する文言・終了理由の全実機パターンは何か。CLIのバージョン更新で文言が変わった場合、どの規則を追加・無効化するか。
+- 推奨案: CLIアダプターごとに規則IDと正規化したパターンを管理し、実機ログから秘密情報を除いた最小サンプルを追加する。未知の文言は`FAILED`または`HUMAN_REQUIRED`として扱い、`RATE_LIMITED`へ推測分類しない。実機試験後に規則を更新する。
+- 回答: Claude Code **2.1.220**で、利用制限時に次のメッセージを確認した。取得状況は利用制限到達後のCLI標準出力／標準エラー調査であり、実プロンプト処理や課金を伴う試験ではない。
+  - 原文: `You've hit your session limit · resets 11am (Asia/Tokyo)`
+  - 採用する判定文字列: `You've hit your session limit`（大文字・小文字を区別しない）
+  - 判定しない部分: リセット時刻、`Asia/Tokyo`などのタイムゾーン。これらは固定文字列として扱わない。
+  - 除外対象: `claude-sonnet-5 is temporarily unavailable`。これは利用枠切れではなく、モデルまたはサービスの一時的な利用不能として`RATE_LIMITED`に分類しない。現実装では一般的な`FAILED`扱いとし、別状態は新設しない。
+  - 未確認: Codex、およびClaude Codeの2.1.220以外のバージョンにおける文言・出力ストリーム・終了コードの全パターン。未知の文言を推測で`RATE_LIMITED`に分類しない。
+
+## Q015
+
+- 状態: ANSWERED
+- 重要度: 高
+- 質問者: Codex
+- 対象ファイル: orchestrator/FAILOVER_DESIGN.md, orchestrator/SPEC.md
+- 質問内容: CLI出力を秘密情報から保護しながら保存するため、保存ファイルは生出力かマスキング済み出力か。SHA-256はどのバイト列に対して計算するか。
+- 推奨案: 生出力を永続化せず、ストリーミング中にマスキングした出力だけを上限付き保存し、その保存済みバイト列のSHA-256を記録する。通知も同じマスキング済み出力の末尾だけを掲載する。
+- 回答: 推奨案を採用する。stdout/stderrを個別に読み取り、チャンク境界をまたぐ秘密情報にも対応する保留バッファを持つ。上限到達後も読み捨てながらdrainし、保存済みマスキング後バイト列のSHA-256を記録する。
+
+## Q016
+
+- 状態: ANSWERED
+- 重要度: 高
+- 質問者: Codex
+- 対象ファイル: orchestrator/FAILOVER_DESIGN.md, orchestrator/SPEC.md, orchestrator/CLASS.md
+- 質問内容: RATE_LIMITED時の代替AIはどの単位で選び、循環・無限引継ぎをどう防ぐか。
+- 推奨案: 各AI定義に順序付き`fallback_agents`を持たせ、依頼ID単位で訪問済みAI、引継ぎ履歴、引継ぎ回数を永続化する。未訪問かつ定義済みの最初の候補だけを選び、`max_handoffs`超過・候補消尽・永続化失敗時は`HUMAN_REQUIRED`とする。
+- 回答: 推奨案を採用する。RATE_LIMITEDでは元AIを再起動せず、同じ依頼IDのHANDOFFメールを代替AIへ送る。代替AIの通常失敗は自動的に引き継がず、RATE_LIMITED根拠がある場合だけ同じ規則を適用する。
+
 ## Q013
 
 - 状態: ANSWERED

@@ -7,6 +7,26 @@ import config
 
 
 class ConfigDefaultsTests(unittest.TestCase):
+    def test_output_and_handoff_defaults(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "config.json"
+            path.write_text('{"agents": []}', encoding="utf-8")
+            cfg = config.load(path)
+        self.assertEqual(cfg.cli_output_max_bytes, 1024 * 1024)
+        self.assertEqual(cfg.cli_output_ring_bytes, 64 * 1024)
+        self.assertEqual(cfg.notification_tail_bytes, 8 * 1024)
+        self.assertEqual(cfg.max_handoffs, 3)
+
+    def test_fallback_agents_are_loaded(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "config.json"
+            path.write_text(json.dumps({"agents": [
+                {"name": "a", "uid": "UID000001", "cli_type": "claude_code",
+                 "fallback_agents": ["b"]},
+                {"name": "b", "uid": "UID000002", "cli_type": "codex"},
+            ]}), encoding="utf-8")
+            cfg = config.load(path)
+        self.assertEqual(cfg.agents[0].fallback_agents, ["b"])
     def _write(self, data: dict) -> Path:
         tmpdir = Path(tempfile.mkdtemp())
         path = tmpdir / "config.json"

@@ -2,8 +2,19 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol
+
+from output_capture import OutputArtifact
+
+
+@dataclass(frozen=True)
+class CliEvidence:
+    rate_limited: bool = False
+    rule_id: str | None = None
+    stream: str | None = None
+    evidence: str | None = None
 
 
 class CliAdapter(Protocol):
@@ -21,4 +32,13 @@ class CliAdapter(Protocol):
         argv (visible in task lists / process logs) or in redacted
         command logging.
         """
+        ...
+
+    def classify_output(
+        self,
+        exit_code: int | None,
+        timed_out: bool,
+        stdout: OutputArtifact,
+        stderr: OutputArtifact,
+    ) -> CliEvidence:
         ...

@@ -160,3 +160,20 @@
 | No | 対象 | 前提条件 | 手順 | 期待結果 | 関連 |
 |---|---|---|---|---|---|
 | T-130 | orchestrator削除後のmail動作 | `orchestrator`フォルダを削除した状態 | `mail`パッケージ単体で送受信を実行 | `mail`単体のメール送受信機能が使用できる | SPEC.md 7章 |
+
+## 14. CLI出力保存・利用制限引継ぎ
+
+| No | 対象 | 前提条件 | 手順 | 期待結果 | 関連 |
+|---|---|---|---|---|---|
+| T-140 | stdout/stderr個別保存 | CLIが両ストリームへ出力 | AIを起動し終了させる | stdoutとstderrが別ファイルに保存され、相対パス・SHA-256・保存量・切捨て有無がJSONLへ記録される | FAILOVER_DESIGN.md |
+| T-141 | 保存量上限とパイプdrain | 上限より大きいデータを高速出力するCLI | AIを起動し終了を待つ | ファイルは各上限以内、プロセスはパイプ詰まりなく終了し、切捨て有りになる | FAILOVER_DESIGN.md |
+| T-142 | チャンク境界の秘密情報 | 秘密文字列を複数チャンクに分割して出力 | AIを起動しログ・ファイル・通知を確認 | 保存末尾・通知・ログに秘密情報がなく、マスキング済み値だけが残る | SPEC.md 23章, 30章 |
+| T-143 | 通知末尾上限 | stdout/stderrに長いエラーを出力 | エラー通知を確認 | 各ストリームのマスキング済み末尾だけが設定バイト数以内で掲載され、全文は掲載されない | SPEC.md 30章 |
+| T-144 | Claude利用制限判定 | Claudeアダプターが既知の制限文言を検出 | 非ゼロ終了CLIを起動 | `RATE_LIMITED`、アダプター名、規則ID、stream、短い根拠が記録される | SPEC.md 26章 |
+| T-145 | 終了コードだけでは誤分類しない | 非ゼロ終了だが制限文言なし | CLIを起動 | `FAILED`になり、`RATE_LIMITED`にはならない | SPEC.md 26章 |
+| T-146 | 代替AI選択 | `fallback_agents`に未訪問候補を複数設定 | RATE_LIMITEDを発生させる | 定義順の最初の候補へ同じ依頼IDのHANDOFFメールが送信され、担当履歴と回数が保存される | FAILOVER_DESIGN.md |
+| T-147 | 同一AI再起動禁止 | 元AIがRATE_LIMITED | 監視サイクルを継続 | 元AIへの通常再試行が発生せず、代替AIだけが起動対象になる | SPEC.md 26章 |
+| T-148 | 引継ぎ循環防止 | A→B→Aのfallback設定 | RATE_LIMITEDを連続発生させる | 訪問済みAを再選択せず、候補消尽後に`HUMAN_REQUIRED`になる | FAILOVER_DESIGN.md |
+| T-149 | 引継ぎ上限 | `max_handoffs`を小さく設定 | RATE_LIMITEDを上限回数発生させる | 上限到達後は引継ぎせず、`HUMAN_REQUIRED`通知を送る | FAILOVER_DESIGN.md |
+| T-150 | 全候補利用不能 | 代替候補が未登録、CLI起動不能、または送信失敗 | RATE_LIMITEDを発生させる | 依頼IDを維持した担当履歴を残し、元送信者へ`HUMAN_REQUIRED`通知を送る | SPEC.md 30章 |
+| T-151 | 再起動途中の引継ぎ | `HANDOFF_PENDING`を保存してプロセス停止 | オーケストレーターを再起動 | 二重HANDOFFを作らず、送信済みなら`HANDOFF_SENT`から代替AI処理を再開する | FAILOVER_DESIGN.md |

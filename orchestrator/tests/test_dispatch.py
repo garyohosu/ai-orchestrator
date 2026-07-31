@@ -16,6 +16,9 @@ from dispatch import (
     extract_job_id,
 )
 from launcher import CliLauncher, CliPathResolver
+from launcher import ProcessResult
+from adapters.base import CliEvidence
+from output_capture import OutputArtifact
 from logging_utils import JobLogger
 from mail_adapter import MailReplyQuery
 from runtime import RuntimeStateStore, TerminalStateStore
@@ -118,6 +121,51 @@ class ExtractJobIdTests(unittest.TestCase):
 
     def test_safe_job_id_characters_pass_through(self) -> None:
         self.assertEqual(extract_job_id("[JOB-A.b_c-9] 依頼", 1), "JOB-A.b_c-9")
+
+    def test_rate_limited_handoff_preserves_job_and_deduplicates(self) -> None:
+        h = DispatchCycleHarness()
+        commander = h.mail.register_user("commander")
+        worker_uid = h.mail.register_user("worker")
+        alt_uid = h.mail.register_user("alternate")
+        worker = AgentDefinition(
+            name="worker", uid=worker_uid, cli_type="fake", command=[],
+            fallback_agents=["alternate"],
+        )
+        alternate = AgentDefinition(name="alternate", uid=alt_uid, cli_type="fake", command=[])
+        h.cycle._agents_by_name = {"worker": worker, "alternate": alternate}
+        h.cycle._system_sender_uid = h.system_uid
+        origin = {"mail_id": 1, "subject": "[JOB-RATE] 依頼", "sender_uid": commander}
+        result = ProcessResult(
+            exit_code=1, timed_out=False, duration_sec=0.1,
+            stdout=OutputArtifact(None, None, 0, 0, False, ""),
+            stderr=OutputArtifact(None, None, 0, 0, False, "You've hit your session limit"),
+            cli_evidence=CliEvidence(True, "claude.rate_limit.session_limit", "stderr", "You've hit your session limit"),
+        )
+        first = h.cycle._handoff_rate_limited(worker, "JOB-RATE", origin, result, 0)
+        self.assertIsNotNone(first)
+        handoffs = h.mail.find_mails(sender_uid=h.system_uid, recipient_uid=alt_uid, request_id="JOB-RATE")
+        self.assertEqual(len(handoffs), 1)
+        self.assertEqual(h.checkpoint_store.load("JOB-RATE").current_state, "HANDOFF_SENT")
+        second = h.cycle._handoff_rate_limited(worker, "JOB-RATE", origin, result, 0)
+        self.assertIsNone(second)
+        self.assertEqual(len(h.mail.find_mails(sender_uid=h.system_uid, recipient_uid=alt_uid, request_id="JOB-RATE")), 1)
+
+    def test_rate_limited_has_no_delivery_retry(self) -> None:
+        self.assertFalse(RetryPolicy(5).should_retry(OutcomeStatus.RATE_LIMITED, 1, False))
+
+    def test_rate_limited_with_no_candidates_returns_no_handoff(self) -> None:
+        h = DispatchCycleHarness()
+        worker = AgentDefinition(name="worker", uid="UID000002", cli_type="fake", command=[])
+        result = ProcessResult(
+            exit_code=1, timed_out=False, duration_sec=0.1,
+            cli_evidence=CliEvidence(True, "claude.rate_limit.session_limit", "stderr", "You've hit your session limit"),
+        )
+        outcome = h.cycle._handoff_rate_limited(
+            worker, "JOB-NO-CANDIDATE",
+            {"mail_id": 1, "subject": "[JOB-NO-CANDIDATE] 依頼", "sender_uid": "UID000001"},
+            result, 0,
+        )
+        self.assertIsNone(outcome)
 
 
 class NoWorkAndOrderingTests(unittest.TestCase):

@@ -7,12 +7,14 @@ import re
 import shutil
 import subprocess
 import sys
+import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
 
-from adapters.base import CliAdapter
+from adapters.base import CliAdapter, CliEvidence
 from config import AgentDefinition
+from output_capture import OutputArtifact, StreamCapture, build_capture
 from timeutil import now_iso
 from winproc import CREATE_NEW_PROCESS_GROUP, get_process_start_time_iso, terminate_process_tree
 
@@ -97,6 +99,9 @@ class ProcessResult:
     # double-launch guard (runtime_store entry) when this is False -- see
     # DispatchCycle._attempt_launch.
     terminated_confirmed: bool = True
+    stdout: OutputArtifact | None = None
+    stderr: OutputArtifact | None = None
+    cli_evidence: CliEvidence = CliEvidence()
 
 
 class LaunchedProcess:
@@ -109,6 +114,9 @@ class LaunchedProcess:
         launch_command: list[str],
         launched_at_iso: str,
         start_time_iso: str,
+        adapter: CliAdapter,
+        stdout_capture: StreamCapture,
+        stderr_capture: StreamCapture,
     ) -> None:
         self._popen = popen
         self.pid = popen.pid
@@ -118,19 +126,75 @@ class LaunchedProcess:
         self.launch_command = launch_command
         self.launched_at_iso = launched_at_iso
         self.start_time_iso = start_time_iso
+        self._adapter = adapter
+        self._stdout_capture = stdout_capture
+        self._stderr_capture = stderr_capture
+        self._capture_threads: list[threading.Thread] = []
+        self._capture_started = False
+
+    def _start_capture(self) -> None:
+        if self._capture_started:
+            return
+        self._capture_started = True
+        self._stdout_capture.start()
+        self._stderr_capture.start()
+        for stream, capture in (
+            (self._popen.stdout, self._stdout_capture),
+            (self._popen.stderr, self._stderr_capture),
+        ):
+            assert stream is not None
+            thread = threading.Thread(target=self._drain, args=(stream, capture), daemon=True)
+            thread.start()
+            self._capture_threads.append(thread)
+
+    @staticmethod
+    def _drain(stream: object, capture: StreamCapture) -> None:
+        reader = stream  # type: ignore[assignment]
+        try:
+            while True:
+                chunk = reader.read(65536)
+                if not chunk:
+                    break
+                capture.feed(chunk)
+        finally:
+            try:
+                reader.close()
+            except (OSError, ValueError):
+                pass
+
+    def _finish_capture(self) -> tuple[OutputArtifact, OutputArtifact]:
+        for thread in self._capture_threads:
+            thread.join(timeout=10)
+        # A descendant that inherited a pipe can keep EOF from arriving.
+        # Close the parent's handles to unblock the reader without retaining
+        # an open file or racing StreamCapture.finish().
+        for stream in (self._popen.stdout, self._popen.stderr):
+            if stream is not None:
+                try:
+                    stream.close()
+                except (OSError, ValueError):
+                    pass
+        for thread in self._capture_threads:
+            thread.join(timeout=1)
+        return self._stdout_capture.finish(), self._stderr_capture.finish()
+
+    def finish_capture(self) -> tuple[OutputArtifact, OutputArtifact]:
+        """Finalize output after an externally interrupted wait."""
+        return self._finish_capture()
 
     def wait(self, timeout_sec: float) -> ProcessResult:
         started = time.monotonic()
         timed_out = False
         terminated_confirmed = True
+        self._start_capture()
         try:
-            self._popen.communicate(timeout=timeout_sec)
+            self._popen.wait(timeout=timeout_sec)
             exit_code: int | None = self._popen.returncode
         except subprocess.TimeoutExpired:
             timed_out = True
             self.terminate()
             try:
-                self._popen.communicate(timeout=10)
+                self._popen.wait(timeout=10)
             except subprocess.TimeoutExpired:
                 pass
             exit_code = None
@@ -138,12 +202,22 @@ class LaunchedProcess:
             # of whether the communicate() above raised again: if the
             # process is truly gone, poll() returns its exit code.
             terminated_confirmed = self._popen.poll() is not None
+        stdout, stderr = self._finish_capture()
+        classify_output = getattr(self._adapter, "classify_output", None)
+        evidence = (
+            classify_output(exit_code, timed_out, stdout, stderr)
+            if classify_output is not None
+            else CliEvidence()
+        )
         duration_sec = time.monotonic() - started
         return ProcessResult(
             exit_code=exit_code,
             timed_out=timed_out,
             duration_sec=duration_sec,
             terminated_confirmed=terminated_confirmed,
+            stdout=stdout,
+            stderr=stderr,
+            cli_evidence=evidence,
         )
 
     def terminate(self) -> None:
@@ -154,12 +228,23 @@ class LaunchedProcess:
 
 
 class CliLauncher:
-    def __init__(self, resolver: CliPathResolver, adapters: dict[str, CliAdapter]) -> None:
+    def __init__(
+        self,
+        resolver: CliPathResolver,
+        adapters: dict[str, CliAdapter],
+        logs_dir: Path | None = None,
+        output_max_bytes: int = 1024 * 1024,
+        output_ring_bytes: int = 64 * 1024,
+    ) -> None:
         self._resolver = resolver
         self._adapters = adapters
+        self._logs_dir = logs_dir
+        self._output_max_bytes = output_max_bytes
+        self._output_ring_bytes = output_ring_bytes
 
     def launch(
-        self, agent: AgentDefinition, job_id: str, origin_mail_id: int, project_path: Path
+        self, agent: AgentDefinition, job_id: str, origin_mail_id: int, project_path: Path,
+        attempt: int = 1,
     ) -> LaunchedProcess:
         command = self._resolver.resolve(agent)
         adapter = self._adapters[agent.cli_type]
@@ -175,12 +260,8 @@ class CliLauncher:
                 cwd=str(project_path),
                 env=env,
                 stdin=subprocess.PIPE,
-                # Output is never inspected or logged (SPEC.md 26章「標準出
-                # 力や標準エラーだけで断定してはならない」), so avoid
-                # buffering it in memory at all -- also removes any risk of
-                # it ending up in a log accidentally.
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
                 creationflags=creationflags,
             )
         except OSError as err:
@@ -206,7 +287,15 @@ class CliLauncher:
         # never equal a real "%Y-%m-%dT...Z" start time, so it always
         # falls through to the safe "not running" / STALE path (SPEC.md 24章).
         start_time_iso = get_process_start_time_iso(popen.pid) or ""
-        return LaunchedProcess(
+        stdout_capture, stderr_capture = build_capture(
+            logs_dir=self._logs_dir,
+            job_id=job_id,
+            attempt=attempt,
+            agent_name=agent.name,
+            max_file_bytes=self._output_max_bytes,
+            ring_bytes=self._output_ring_bytes,
+        )
+        launched = LaunchedProcess(
             popen=popen,
             agent=agent,
             job_id=job_id,
@@ -214,7 +303,14 @@ class CliLauncher:
             launch_command=argv,
             launched_at_iso=launched_at,
             start_time_iso=start_time_iso,
+            adapter=adapter,
+            stdout_capture=stdout_capture,
+            stderr_capture=stderr_capture,
         )
+        # Start drainers before returning so a fast CLI cannot fill a pipe
+        # during the caller's small gap before wait().
+        launched._start_capture()
+        return launched
 
     def _build_fixed_instruction(self, agent: AgentDefinition) -> str:
         return FIXED_INSTRUCTION_TEMPLATE.format(agent_name=agent.name, uid=agent.uid)

@@ -42,6 +42,7 @@ class OutcomeStatus(Enum):
     NO_WORK = "NO_WORK"
     DELIVERY_FAILED = "DELIVERY_FAILED"
     FAILED = "FAILED"
+    RATE_LIMITED = "RATE_LIMITED"
     TIMEOUT = "TIMEOUT"
     NO_REPLY = "NO_REPLY"
     HUMAN_REQUIRED = "HUMAN_REQUIRED"
@@ -49,7 +50,7 @@ class OutcomeStatus(Enum):
 
 
 class OutcomeClassifier:
-    """CLI起動可否・終了コード・タイムアウト・返信有無から状態を確定 (SPEC.md 26,30章)."""
+    """CLI結果とCLI固有の根拠付き証拠から状態を確定."""
 
     def classify(
         self,
@@ -61,6 +62,8 @@ class OutcomeClassifier:
         if cli_launch_failed:
             return OutcomeStatus.DELIVERY_FAILED
         assert process_result is not None
+        if process_result.cli_evidence.rate_limited:
+            return OutcomeStatus.RATE_LIMITED
         if process_result.timed_out:
             return OutcomeStatus.TIMEOUT
         if process_result.exit_code != 0:
@@ -152,6 +155,14 @@ class NotificationDetail:
     last_attempt_at: str
     origin_mail_status: str
     recommended_action: str
+    stdout_tail: str = ""
+    stderr_tail: str = ""
+    stdout_artifact: dict[str, object] | None = None
+    stderr_artifact: dict[str, object] | None = None
+    classification: dict[str, object] | None = None
+    handoff_count: int = 0
+    visited_agents: list[str] = field(default_factory=list)
+    handoff_reason: str | None = None
 
 
 _UID_PATTERN = re.compile(r"^UID[0-9]{6,}$")
@@ -159,6 +170,7 @@ _UID_PATTERN = re.compile(r"^UID[0-9]{6,}$")
 _SUBJECT_TAGS = {
     OutcomeStatus.DELIVERY_FAILED: "DELIVERY_FAILED",
     OutcomeStatus.FAILED: "FAILED",
+    OutcomeStatus.RATE_LIMITED: "RATE_LIMITED",
     OutcomeStatus.TIMEOUT: "TIMEOUT",
     OutcomeStatus.NO_REPLY: "NO_REPLY",
     OutcomeStatus.HUMAN_REQUIRED: "HUMAN_REQUIRED",
@@ -168,9 +180,10 @@ _SUBJECT_TAGS = {
 class ErrorNotifier:
     """System-sender error notification with no recursive notification (SPEC.md 30章)."""
 
-    def __init__(self, mail_adapter: MailPort, system_sender_uid: str) -> None:
+    def __init__(self, mail_adapter: MailPort, system_sender_uid: str, tail_bytes: int = 8 * 1024) -> None:
         self._mail = mail_adapter
         self._system_sender_uid = system_sender_uid
+        self._tail_bytes = tail_bytes
 
     def is_terminal_recipient_invalid(self, recipient_uid: str | None) -> bool:
         if not recipient_uid or not _UID_PATTERN.fullmatch(recipient_uid):
@@ -223,11 +236,26 @@ class ErrorNotifier:
             f"再試行回数: {detail.retry_count}",
             f"最終試行日時: {detail.last_attempt_at}",
             f"元メールの状態: {detail.origin_mail_status}",
+            f"判定根拠: {detail.classification or 'なし'}",
+            f"stdout証跡: {detail.stdout_artifact or 'なし'}",
+            f"stderr証跡: {detail.stderr_artifact or 'なし'}",
+            f"引継ぎ回数: {detail.handoff_count}",
+            f"担当履歴: {detail.visited_agents}",
+            "stdout末尾:",
+            self._bounded_tail(detail.stdout_tail),
+            "stderr末尾:",
+            self._bounded_tail(detail.stderr_tail),
             "",
             "推奨する次の対応:",
             detail.recommended_action,
         ]
         return "\n".join(lines)
+
+    def _bounded_tail(self, text: str) -> str:
+        data = text.encode("utf-8")
+        if len(data) <= self._tail_bytes:
+            return text
+        return "[TRUNCATED]\n" + data[-self._tail_bytes :].decode("utf-8", errors="replace")
 
 
 @dataclass(frozen=True)
@@ -239,6 +267,9 @@ class Checkpoint:
     artifacts: list[str] = field(default_factory=list)
     open_issues: list[str] = field(default_factory=list)
     next_actions: list[str] = field(default_factory=list)
+    handoff_count: int = 0
+    visited_agents: list[str] = field(default_factory=list)
+    handoff_history: list[dict[str, str]] = field(default_factory=list)
     updated_at: str = field(default_factory=now_iso)
 
 
@@ -270,6 +301,9 @@ class CheckpointStore:
             "artifacts": checkpoint.artifacts,
             "open_issues": checkpoint.open_issues,
             "next_actions": checkpoint.next_actions,
+            "handoff_count": checkpoint.handoff_count,
+            "visited_agents": checkpoint.visited_agents,
+            "handoff_history": checkpoint.handoff_history,
             "updated_at": checkpoint.updated_at,
         }
         tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -330,6 +364,9 @@ class DispatchCycle:
         project_path: Path,
         cli_timeout_sec: int,
         reply_check_timeout_sec: int,
+        agents: list[AgentDefinition] | None = None,
+        system_sender_uid: str | None = None,
+        max_handoffs: int = 3,
     ) -> None:
         self._watcher = watcher
         self._launcher = launcher
@@ -347,6 +384,9 @@ class DispatchCycle:
         self._project_path = project_path
         self._cli_timeout_sec = cli_timeout_sec
         self._reply_check_timeout_sec = reply_check_timeout_sec
+        self._agents_by_name = {a.name: a for a in (agents or [])}
+        self._system_sender_uid = system_sender_uid
+        self._max_handoffs = max_handoffs
 
     def run_one_pass(
         self, agents: list[AgentDefinition], should_stop_launching: Callable[[], bool] | None = None
@@ -402,9 +442,20 @@ class DispatchCycle:
                     exit_code=process_result.exit_code if process_result else None,
                     result=status.value,
                     next_recipient=None,
+                    stdout_artifact=self._artifact_dict(process_result, "stdout"),
+                    stderr_artifact=self._artifact_dict(process_result, "stderr"),
+                    classification=self._classification_dict(process_result),
                 )
             )
             return AgentOutcome(agent, status, job_id, origin_mail["mail_id"])
+
+        if status == OutcomeStatus.RATE_LIMITED:
+            handoff_outcome = self._handoff_rate_limited(
+                agent, job_id, origin_mail, process_result, retry_count
+            )
+            if handoff_outcome is not None:
+                return handoff_outcome
+            status = OutcomeStatus.HUMAN_REQUIRED
 
         # Terminal failure: notify origin sender, mark terminal, checkpoint, log.
         detail = NotificationDetail(
@@ -418,6 +469,11 @@ class DispatchCycle:
             last_attempt_at=now_iso(),
             origin_mail_status="処理失敗",
             recommended_action=self._recommended_action_for(status, agent),
+            stdout_tail=self._notification_tail(process_result, "stdout"),
+            stderr_tail=self._notification_tail(process_result, "stderr"),
+            stdout_artifact=self._artifact_dict(process_result, "stdout"),
+            stderr_artifact=self._artifact_dict(process_result, "stderr"),
+            classification=self._classification_dict(process_result),
         )
         notified = self._notifier.notify(
             job_id, origin_mail["mail_id"], origin_mail["sender_uid"], status, detail
@@ -445,9 +501,145 @@ class DispatchCycle:
                 result=final_status.value,
                 error=detail.reason,
                 next_recipient=origin_mail["sender_uid"] if notified else None,
+                stdout_artifact=detail.stdout_artifact,
+                stderr_artifact=detail.stderr_artifact,
+                classification=detail.classification,
             )
         )
         return AgentOutcome(agent, final_status, job_id, origin_mail["mail_id"])
+
+    @staticmethod
+    def _artifact_dict(result: ProcessResult | None, stream: str) -> dict[str, object] | None:
+        artifact = getattr(result, stream, None) if result is not None else None
+        return artifact.as_dict() if artifact is not None else None
+
+    @staticmethod
+    def _notification_tail(result: ProcessResult | None, stream: str) -> str:
+        artifact = getattr(result, stream, None) if result is not None else None
+        return artifact.tail if artifact is not None else ""
+
+    @staticmethod
+    def _classification_dict(result: ProcessResult | None) -> dict[str, object] | None:
+        if result is None:
+            return None
+        evidence = result.cli_evidence
+        return {
+            "source": "cli_adapter",
+            "rule_id": evidence.rule_id,
+            "stream": evidence.stream,
+            "evidence": evidence.evidence,
+        }
+
+    def _handoff_rate_limited(
+        self, agent: AgentDefinition, job_id: str, origin_mail: dict,
+        result: ProcessResult | None, retry_count: int,
+    ) -> AgentOutcome | None:
+        checkpoint = self._checkpoint_store.load(job_id)
+        visited = list(checkpoint.visited_agents if checkpoint else [])
+        if agent.name not in visited:
+            visited.append(agent.name)
+        handoff_count = checkpoint.handoff_count if checkpoint else 0
+        history = list(checkpoint.handoff_history if checkpoint else [])
+        if handoff_count >= self._max_handoffs or self._system_sender_uid is None:
+            return None
+        candidates = [
+            self._agents_by_name[name] for name in agent.fallback_agents
+            if name in self._agents_by_name
+            and name not in visited
+            and self._agents_by_name[name].uid not in {agent.uid}
+        ]
+        if not candidates:
+            return None
+        candidate = None
+        for candidate_option in candidates:
+            body = self._build_handoff_body(
+                agent, candidate_option, job_id, origin_mail, result, handoff_count + 1, visited
+            )
+            subject = f"[{job_id}][HANDOFF] {agent.name}から{candidate_option.name}へ引継ぎ"
+            try:
+                self._checkpoint_store.save(Checkpoint(
+                    job_id=job_id,
+                    purpose=origin_mail["subject"],
+                    current_state="HANDOFF_PENDING",
+                    open_issues=["RATE_LIMITED"],
+                    next_actions=[f"{candidate_option.name}へ引継ぎメールを送信"],
+                    handoff_count=handoff_count,
+                    visited_agents=visited,
+                    handoff_history=history,
+                ))
+                existing = self._mail.find_mails(
+                    sender_uid=self._system_sender_uid,
+                    recipient_uid=candidate_option.uid,
+                    request_id=job_id,
+                    limit=1,
+                )
+                if not existing:
+                    self._mail.send_mail(self._system_sender_uid, candidate_option.uid, subject, body)
+                candidate = candidate_option
+                break
+            except (OSError, ValueError, RuntimeError):
+                candidate = None
+                continue
+            except Exception:
+                candidate = None
+                continue
+        if candidate is None:
+            return None
+        history.append({
+            "from_agent": agent.name,
+            "to_agent": candidate.name,
+            "reason": "RATE_LIMITED",
+            "at": now_iso(),
+            "classification_rule": result.cli_evidence.rule_id if result else "unknown",
+        })
+        try:
+            self._checkpoint_store.save(Checkpoint(
+                job_id=job_id,
+                purpose=origin_mail["subject"],
+                current_state="HANDOFF_SENT",
+                open_issues=["RATE_LIMITED"],
+                next_actions=[f"{candidate.name}の引継ぎメール処理を待機"],
+                handoff_count=handoff_count + 1,
+                visited_agents=visited + [candidate.name],
+                handoff_history=history,
+            ))
+        except OSError:
+            return None
+        self._terminal_store.mark(origin_mail["mail_id"], OutcomeStatus.RATE_LIMITED.value)
+        self._logger.log_outcome(LogEntry(
+            job_id=job_id,
+            mail_id=origin_mail["mail_id"],
+            agent_name=agent.name,
+            command_summary=None,
+            started_at=None,
+            finished_at=now_iso(),
+            exit_code=result.exit_code if result else None,
+            result=OutcomeStatus.RATE_LIMITED.value,
+            next_recipient=candidate.uid,
+            stdout_artifact=self._artifact_dict(result, "stdout"),
+            stderr_artifact=self._artifact_dict(result, "stderr"),
+            classification=self._classification_dict(result),
+            handoff_count=handoff_count + 1,
+            visited_agents=visited + [candidate.name],
+            handoff_reason="RATE_LIMITED",
+        ))
+        return AgentOutcome(agent, OutcomeStatus.RATE_LIMITED, job_id, origin_mail["mail_id"])
+
+    def _build_handoff_body(self, agent, candidate, job_id, origin_mail, result, count, visited):
+        evidence = result.cli_evidence if result else None
+        return "\n".join([
+            f"状態: RATE_LIMITED",
+            f"依頼ID: {job_id}",
+            f"元メールID: {origin_mail['mail_id']}",
+            f"元の送信者UID: {origin_mail['sender_uid']}",
+            f"前担当AI: {agent.name} ({agent.uid})",
+            f"次担当AI: {candidate.name} ({candidate.uid})",
+            f"引継ぎ回数: {count}",
+            f"担当履歴: {visited}",
+            f"判定規則: {evidence.rule_id if evidence else 'unknown'}",
+            f"判定根拠: {evidence.evidence if evidence else 'unknown'}",
+            "引継ぎ情報: checkpointsの依頼IDファイルを確認してください。",
+        ])
 
     def _is_agent_running(self, agent: AgentDefinition) -> bool:
         # A leftover running-*.json should only exist for a genuinely
@@ -486,7 +678,18 @@ class DispatchCycle:
         if not self._project_path.is_dir():
             return OutcomeStatus.DELIVERY_FAILED, None
         try:
-            launched = self._launcher.launch(agent, job_id, origin_mail["mail_id"], self._project_path)
+            try:
+                launched = self._launcher.launch(
+                    agent, job_id, origin_mail["mail_id"], self._project_path, attempt=attempt
+                )
+            except TypeError as err:
+                # Preserve compatibility with test/dedicated launchers that
+                # implement the pre-output-capture four-argument contract.
+                if "attempt" not in str(err):
+                    raise
+                launched = self._launcher.launch(
+                    agent, job_id, origin_mail["mail_id"], self._project_path
+                )
         except CliNotFoundError:
             return OutcomeStatus.DELIVERY_FAILED, None
 
@@ -526,6 +729,10 @@ class DispatchCycle:
             # before propagating the stop.
             launched.terminate()
             confirmed = launched.has_exited()
+            try:
+                stdout_artifact, stderr_artifact = launched.finish_capture()
+            except Exception:
+                stdout_artifact = stderr_artifact = None
             detail = NotificationDetail(
                 target_agent_name=agent.name,
                 target_agent_uid=agent.uid,
@@ -537,6 +744,10 @@ class DispatchCycle:
                 last_attempt_at=now_iso(),
                 origin_mail_status="処理中断",
                 recommended_action="オーケストレーターを再起動してください。次回起動時にSTALE復旧が行われます。",
+                stdout_tail=stdout_artifact.tail if stdout_artifact else "",
+                stderr_tail=stderr_artifact.tail if stderr_artifact else "",
+                stdout_artifact=stdout_artifact.as_dict() if stdout_artifact else None,
+                stderr_artifact=stderr_artifact.as_dict() if stderr_artifact else None,
             )
             notified = self._notifier.notify(
                 job_id, origin_mail["mail_id"], origin_mail["sender_uid"],

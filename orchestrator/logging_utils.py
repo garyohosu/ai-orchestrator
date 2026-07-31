@@ -33,6 +33,12 @@ class LogEntry:
     changed_files: list[str] = field(default_factory=list)
     error: str | None = None
     next_recipient: str | None = None
+    stdout_artifact: dict[str, object] | None = None
+    stderr_artifact: dict[str, object] | None = None
+    classification: dict[str, object] | None = None
+    handoff_count: int = 0
+    visited_agents: list[str] = field(default_factory=list)
+    handoff_reason: str | None = None
     timestamp: str = field(default_factory=now_iso)
 
 
@@ -72,6 +78,12 @@ class JobLogger:
             "changed_files": entry.changed_files,
             "error": _scrub(entry.error),
             "next_recipient": entry.next_recipient,
+            "stdout": entry.stdout_artifact,
+            "stderr": entry.stderr_artifact,
+            "classification": entry.classification,
+            "handoff_count": entry.handoff_count,
+            "visited_agents": entry.visited_agents,
+            "handoff_reason": _scrub(entry.handoff_reason),
         }
         with self._log_path.open("a", encoding="utf-8") as fh:
             fh.write(json.dumps(record, ensure_ascii=False) + "\n")

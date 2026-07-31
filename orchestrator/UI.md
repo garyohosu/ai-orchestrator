@@ -52,7 +52,7 @@ flowchart TD
   - 起動時: 検出したプロジェクトルート、`mail`フォルダ、読み込んだ`config.json`の要約
   - 監視サイクルごと: 確認時刻、対象AI名、未読数（0件時は表示を省略または簡潔なハートビートのみ）
   - AI起動時: 起動したAI名、依頼ID、開始時刻
-  - AI終了時: 終了コード、実行時間、判定結果（`SUCCESS` / `NO_REPLY` / `TIMEOUT` / `FAILED` / `DELIVERY_FAILED` / `HUMAN_REQUIRED`）
+  - AI終了時: 終了コード、実行時間、判定結果（`SUCCESS` / `NO_REPLY` / `TIMEOUT` / `FAILED` / `DELIVERY_FAILED` / `RATE_LIMITED` / `HUMAN_REQUIRED`）
   - エラー通知送信時: 送信先UID、状態、依頼ID
 - **正常系**: 未読メールがあるAIを`config.json`のエージェント定義順に起動し、結果を1行ずつ追記表示する。
 - **空状態**: 全AIの未読が0件の場合、「待機中」を示す簡潔な表示のみとし、AIやLLMを呼び出さない（SPEC.md 15章）。
@@ -83,3 +83,10 @@ flowchart TD
 ## 3. 出力先とログの関係
 
 コンソール出力は簡潔な要約に限定し、詳細は`orchestrator/logs/`へ記録する（SPEC.md 23章）。コンソールにもログにも、APIキー・認証情報・Cookie・秘密の環境変数を出力しない。
+
+## 4. RATE_LIMITEDと引継ぎの表示
+
+- AI終了時に`RATE_LIMITED`が判定された場合は、CLI名、判定根拠の規則ID、引継ぎ回数、選択した代替AIを表示する。
+- stdout/stderrの内容はコンソールへ全文表示せず、「個別保存済み」「相対パス」「SHA-256」「切捨て有無」の要約だけを表示する。
+- 候補なし、循環検出、引継ぎ上限到達、または引継ぎ送信・保存失敗時は`HUMAN_REQUIRED`、理由、担当履歴を表示する。
+- 通知本文へ掲載した末尾出力はコンソールへ再掲せず、秘密情報をマスキングした値だけを扱う。

@@ -4,6 +4,9 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from adapters.base import CliEvidence
+from output_capture import OutputArtifact
+
 
 class CodexCliAdapter:
     cli_type = "codex"
@@ -25,3 +28,13 @@ class CodexCliAdapter:
             str(project_path),
             "-",
         ]
+
+    def classify_output(
+        self,
+        exit_code: int | None,
+        timed_out: bool,
+        stdout: OutputArtifact,
+        stderr: OutputArtifact,
+    ) -> CliEvidence:
+        # No Codex rate-limit pattern has been confirmed in this project yet.
+        return CliEvidence()

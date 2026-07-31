@@ -17,6 +17,10 @@ DEFAULT_MAX_RUN_DURATION_SEC = 14400
 DEFAULT_LOGS_DIR = "logs"
 DEFAULT_CHECKPOINTS_DIR = "checkpoints"
 DEFAULT_RUNTIME_DIR = "runtime"
+DEFAULT_CLI_OUTPUT_MAX_BYTES = 1024 * 1024
+DEFAULT_CLI_OUTPUT_RING_BYTES = 64 * 1024
+DEFAULT_NOTIFICATION_TAIL_BYTES = 8 * 1024
+DEFAULT_MAX_HANDOFFS = 3
 
 # Same contract as mail/SPEC.md's UID format: "UID" + 6 or more ASCII digits.
 _UID_PATTERN = re.compile(r"^UID[0-9]{6,}$")
@@ -34,6 +38,7 @@ class AgentDefinition:
     cli_type: str
     command: list[str] = field(default_factory=list)
     order_index: int = 0
+    fallback_agents: list[str] = field(default_factory=list)
 
 
 @dataclass(frozen=True)
@@ -49,6 +54,10 @@ class OrchestratorConfig:
     logs_dir: str
     checkpoints_dir: str
     runtime_dir: str
+    cli_output_max_bytes: int
+    cli_output_ring_bytes: int
+    notification_tail_bytes: int
+    max_handoffs: int
 
 
 def _positive_int(data: dict[str, Any], key: str, default: int) -> int:
@@ -85,6 +94,7 @@ def _parse_agents(raw_agents: Any) -> list[AgentDefinition]:
         uid = entry.get("uid")
         cli_type = entry.get("cli_type")
         command = entry.get("command", [])
+        fallback_agents = entry.get("fallback_agents", [])
         if not isinstance(name, str) or not name:
             raise ConfigValidationError(f"agents[{index}].name must be a non-empty string")
         if not isinstance(uid, str) or not _UID_PATTERN.fullmatch(uid):
@@ -97,6 +107,8 @@ def _parse_agents(raw_agents: Any) -> list[AgentDefinition]:
             )
         if not isinstance(command, list) or not all(isinstance(item, str) for item in command):
             raise ConfigValidationError(f"agents[{index}].command must be a list of strings")
+        if not isinstance(fallback_agents, list) or not all(isinstance(item, str) for item in fallback_agents):
+            raise ConfigValidationError(f"agents[{index}].fallback_agents must be a list of strings")
         if name in seen_names:
             raise ConfigValidationError(f"duplicate agent name: {name!r}")
         if uid in seen_uids:
@@ -105,9 +117,20 @@ def _parse_agents(raw_agents: Any) -> list[AgentDefinition]:
         seen_uids.add(uid)
         agents.append(
             AgentDefinition(
-                name=name, uid=uid, cli_type=cli_type, command=list(command), order_index=index
+                name=name, uid=uid, cli_type=cli_type, command=list(command), order_index=index,
+                fallback_agents=list(fallback_agents),
             )
         )
+    for agent in agents:
+        for fallback_name in agent.fallback_agents:
+            if fallback_name not in seen_names:
+                raise ConfigValidationError(
+                    f"agent {agent.name!r} references unknown fallback agent {fallback_name!r}"
+                )
+            if fallback_name == agent.name:
+                raise ConfigValidationError(
+                    f"agent {agent.name!r} cannot use itself as a fallback"
+                )
     return agents
 
 
@@ -152,5 +175,15 @@ def load(path: Path) -> OrchestratorConfig:
         logs_dir=data.get("logs_dir", DEFAULT_LOGS_DIR),
         checkpoints_dir=data.get("checkpoints_dir", DEFAULT_CHECKPOINTS_DIR),
         runtime_dir=data.get("runtime_dir", DEFAULT_RUNTIME_DIR),
+        cli_output_max_bytes=_positive_int(
+            data, "cli_output_max_bytes", DEFAULT_CLI_OUTPUT_MAX_BYTES
+        ),
+        cli_output_ring_bytes=_positive_int(
+            data, "cli_output_ring_bytes", DEFAULT_CLI_OUTPUT_RING_BYTES
+        ),
+        notification_tail_bytes=_positive_int(
+            data, "notification_tail_bytes", DEFAULT_NOTIFICATION_TAIL_BYTES
+        ),
+        max_handoffs=_nonnegative_int(data, "max_handoffs", DEFAULT_MAX_HANDOFFS),
     )
     return config

@@ -108,12 +108,20 @@ class OrchestratorContext:
         self.runtime_store = RuntimeStateStore(self.runtime_dir)
         self.terminal_store = TerminalStateStore(self.runtime_dir)
         self.reply_query = MailReplyQuery(self.mail_adapter)
-        self.notifier = ErrorNotifier(self.mail_adapter, self.system_uid)
+        self.notifier = ErrorNotifier(
+            self.mail_adapter, self.system_uid, self.config.notification_tail_bytes
+        )
         self.round_trips = RoundTripCounter(self.config.max_round_trips, runtime_dir=self.runtime_dir)
 
         adapters = build_adapters()
         cli_resolver = CliPathResolver(adapters)
-        launcher = CliLauncher(cli_resolver, adapters)
+        launcher = CliLauncher(
+            cli_resolver,
+            adapters,
+            logs_dir=self.logs_dir,
+            output_max_bytes=self.config.cli_output_max_bytes,
+            output_ring_bytes=self.config.cli_output_ring_bytes,
+        )
         watcher = MailWatcher(self.mail_adapter)
 
         self.dispatch_cycle = DispatchCycle(
@@ -132,6 +140,9 @@ class OrchestratorContext:
             project_path=self.project_path,
             cli_timeout_sec=self.config.cli_timeout_sec,
             reply_check_timeout_sec=self.config.reply_check_timeout_sec,
+            agents=self.config.agents,
+            system_sender_uid=self.system_uid,
+            max_handoffs=self.config.max_handoffs,
         )
 
         self.run_duration_guard = RunDurationGuard(self.config.max_run_duration_sec)
