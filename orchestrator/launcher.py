@@ -59,6 +59,8 @@ FIXED_INSTRUCTION_TEMPLATE = (
     "プロジェクト内のmailパッケージを使い、自分宛ての未読メールを確認してください。\n"
     "引継ぎ情報がある場合は確認してください。\n"
     "メールの指示を実行し、指定された宛先へ結果をメールしてください。\n"
+    "Blocking質問を作成した場合は、QandA.md更新・質問メール送信・agent_reply.py wait --result-file の実行後、WAITING_FOR_DECISIONを報告して終了してください。\n"
+    "WAITING_FOR_DECISIONを送信した後、同じCLIプロセス内で回答を待ったり追加作業を続けたりしてはいけません。\n"
     "処理対象がなくなったら終了してください。\n"
 )
 

@@ -23,6 +23,7 @@ from timeutil import now_iso, shift_ms
 from winproc import is_same_running_process
 
 _JOB_ID_PATTERN = re.compile(r"^\[(JOB-[^\]]+)\]")
+_DECISION_ID_PATTERN = re.compile(r"\[(DEC-[A-Za-z0-9._-]+)\]")
 # job_id becomes a filename component (checkpoints/{job_id}.json,
 # runtime/running-{job_id}.json). A mail subject is attacker/AI-controlled
 # text, so anything extracted from it must be restricted to a safe charset
@@ -176,6 +177,8 @@ class NotificationDetail:
     handoff_count: int = 0
     visited_agents: list[str] = field(default_factory=list)
     handoff_reason: str | None = None
+    decision_id: str | None = None
+    timeout_sec: int | None = None
 
 
 _UID_PATTERN = re.compile(r"^UID[0-9]{6,}$")
@@ -236,6 +239,15 @@ class ErrorNotifier:
         detail: NotificationDetail,
     ) -> str:
         lines = [
+            f"status: {'TIMED_OUT' if status == OutcomeStatus.TIMEOUT else status.value}",
+            f"job_id: {job_id}",
+            f"decision_id: {detail.decision_id or 'unknown'}",
+            f"agent_uid: {detail.target_agent_uid}",
+            f"exit_code: {detail.exit_code if detail.exit_code is not None else 'unknown'}",
+            f"timeout_sec: {detail.timeout_sec if detail.timeout_sec is not None else 'unknown'}",
+            f"stdout_log: {(detail.stdout_artifact or {}).get('relative_path', 'none')}",
+            f"stderr_log: {(detail.stderr_artifact or {}).get('relative_path', 'none')}",
+            f"occurred_at: {detail.last_attempt_at}",
             f"状態: {status.value}",
             f"依頼ID: {job_id}",
             f"元メールID: {origin_mail_id}",
@@ -424,6 +436,8 @@ class DispatchCycle:
 
         origin_mail = pending_mails[0]
         job_id = extract_job_id(origin_mail["subject"], origin_mail["mail_id"], logger=self._logger)
+        decision_match = _DECISION_ID_PATTERN.search(origin_mail.get("subject", ""))
+        decision_id = decision_match.group(1) if decision_match else None
 
         if self._round_trips.is_exceeded(job_id):
             self._finalize_without_notify(
@@ -487,6 +501,8 @@ class DispatchCycle:
             stdout_artifact=self._artifact_dict(process_result, "stdout"),
             stderr_artifact=self._artifact_dict(process_result, "stderr"),
             classification=self._classification_dict(process_result),
+            decision_id=decision_id,
+            timeout_sec=self._cli_timeout_sec if status == OutcomeStatus.TIMEOUT else None,
         )
         notified = self._notifier.notify(
             job_id, origin_mail["mail_id"], origin_mail["sender_uid"], status, detail

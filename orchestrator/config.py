@@ -24,7 +24,7 @@ DEFAULT_MAX_HANDOFFS = 3
 
 # Same contract as mail/SPEC.md's UID format: "UID" + 6 or more ASCII digits.
 _UID_PATTERN = re.compile(r"^UID[0-9]{6,}$")
-_KNOWN_CLI_TYPES = ("codex", "claude_code")
+_KNOWN_CLI_TYPES = ("codex", "claude_code", "director")
 
 
 class ConfigValidationError(Exception):
@@ -97,7 +97,9 @@ def _parse_agents(raw_agents: Any) -> list[AgentDefinition]:
         fallback_agents = entry.get("fallback_agents", [])
         if not isinstance(name, str) or not name:
             raise ConfigValidationError(f"agents[{index}].name must be a non-empty string")
-        if not isinstance(uid, str) or not _UID_PATTERN.fullmatch(uid):
+        if cli_type == "director" and uid == "AUTO":
+            pass
+        elif not isinstance(uid, str) or not _UID_PATTERN.fullmatch(uid):
             raise ConfigValidationError(
                 f"agents[{index}].uid must match ^UID[0-9]{{6,}}$, got {uid!r}"
             )

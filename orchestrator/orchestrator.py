@@ -19,6 +19,7 @@ for _stream in (sys.stdout, sys.stderr):
         pass
 
 import argparse
+from dataclasses import replace
 
 import config as config_module
 from adapters import build_adapters
@@ -93,6 +94,13 @@ class OrchestratorContext:
             raise StartupError(str(err)) from err
 
         self.system_uid = self.mail_adapter.register_user(SYSTEM_AGENT_NAME)
+
+        runtime_agents = []
+        for agent in self.config.agents:
+            if agent.cli_type == "director" and agent.uid == "AUTO":
+                agent = replace(agent, uid=self.mail_adapter.register_user(agent.name))
+            runtime_agents.append(agent)
+        self.config = replace(self.config, agents=runtime_agents)
 
         for agent in self.config.agents:
             try:

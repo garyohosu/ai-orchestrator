@@ -4,6 +4,7 @@ from pathlib import Path
 from adapters import build_adapters
 from adapters.claude_code import ClaudeCodeCliAdapter
 from adapters.codex import CodexCliAdapter
+from adapters.director import DirectorCliAdapter
 from output_capture import OutputArtifact
 
 
@@ -42,7 +43,10 @@ class ClaudeCodeAdapterTests(unittest.TestCase):
 class RegistryTests(unittest.TestCase):
     def test_build_adapters_has_both_known_types(self) -> None:
         adapters = build_adapters()
-        self.assertEqual(set(adapters), {"codex", "claude_code"})
+        self.assertEqual(set(adapters), {"codex", "claude_code", "director"})
+
+    def test_director_adapter_only_runs_one_once_pass(self) -> None:
+        self.assertEqual(DirectorCliAdapter().build_argv(["py", "-3", "director/director.py"], Path("C:/proj"))[-1], "--once")
 
 
 if __name__ == "__main__":

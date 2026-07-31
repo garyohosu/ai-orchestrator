@@ -395,6 +395,8 @@ class NotificationTests(unittest.TestCase):
         h.cycle.run_one_pass([agent])
         notification = h.mail._mails[-1]
         for label in (
+            "status:", "job_id:", "decision_id:", "agent_uid:", "exit_code:", "timeout_sec:",
+            "stdout_log:", "stderr_log:", "occurred_at:",
             "状態:", "依頼ID:", "元メールID:", "元の送信者UID:", "処理対象AI:",
             "処理対象UID:", "失敗段階:", "失敗理由:", "CLI終了コード:", "実行時間:",
             "再試行回数:", "最終試行日時:", "元メールの状態:", "推奨する次の対応:",

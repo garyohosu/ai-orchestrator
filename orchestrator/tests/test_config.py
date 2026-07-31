@@ -83,6 +83,13 @@ class ConfigDefaultsTests(unittest.TestCase):
         with self.assertRaises(config.ConfigValidationError):
             config.load(path)
 
+    def test_director_auto_uid_is_allowed_only_for_director(self) -> None:
+        path = self._write({"agents": [{"name": "director", "uid": "AUTO", "cli_type": "director"}]})
+        self.assertEqual(config.load(path).agents[0].uid, "AUTO")
+        bad = self._write({"agents": [{"name": "worker", "uid": "AUTO", "cli_type": "claude_code"}]})
+        with self.assertRaises(config.ConfigValidationError):
+            config.load(bad)
+
     def test_unknown_cli_type_raises(self) -> None:
         path = self._write(
             {"agents": [{"name": "a", "uid": "UID000001", "cli_type": "bogus"}]}
