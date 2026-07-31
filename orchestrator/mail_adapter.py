@@ -49,8 +49,9 @@ class MailPort(Protocol):
 class MailModuleAdapter:
     """Thin wrapper around the real, sibling ``mail`` package (SPEC.md 7章)."""
 
-    def __init__(self, mail_dir: Path) -> None:
+    def __init__(self, mail_dir: Path, db_path: Path | None = None) -> None:
         self._mail_dir = Path(mail_dir)
+        self._db_path = db_path
         self._module = self._load_module()
         self.errors = types.SimpleNamespace(
             AgentMailError=self._module.AgentMailError,
@@ -89,23 +90,23 @@ class MailModuleAdapter:
         return module
 
     def register_user(self, name: str) -> str:
-        return self._module.register_user(name)
+        return self._module.register_user(name, db_path=self._db_path)
 
     def list_users(self) -> list[dict]:
-        return self._module.list_users()
+        return self._module.list_users(db_path=self._db_path)
 
     def send_mail(self, sender_uid: str, recipient_uid: str, subject: str, body: str) -> int:
-        return self._module.send_mail(sender_uid, recipient_uid, subject, body)
+        return self._module.send_mail(sender_uid, recipient_uid, subject, body, db_path=self._db_path)
 
     def check_mail(self, uid: str) -> int:
-        return self._module.check_mail(uid)
+        return self._module.check_mail(uid, db_path=self._db_path)
 
     def receive_mail(self, uid: str) -> list[dict]:
         # SPEC.md 15章 assigns metadata retrieval for dispatch decisions to
         # find_mails (QandA Q013); this wrapper exists only because SPEC.md
         # 7章 lists receive_mail among the six allowed functions, and the
         # AI CLI process itself calls it after being launched.
-        return self._module.receive_mail(uid)
+        return self._module.receive_mail(uid, db_path=self._db_path)
 
     def find_mails(
         self,
@@ -126,6 +127,7 @@ class MailModuleAdapter:
             sent_after=sent_after,
             is_read=is_read,
             limit=limit,
+            db_path=self._db_path,
         )
 
 
