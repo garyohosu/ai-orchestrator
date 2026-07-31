@@ -244,13 +244,13 @@ class CliLauncher:
 
     def launch(
         self, agent: AgentDefinition, job_id: str, origin_mail_id: int, project_path: Path,
-        attempt: int = 1,
+        attempt: int = 1, env_vars: dict[str, str] | None = None,
     ) -> LaunchedProcess:
         command = self._resolver.resolve(agent)
         adapter = self._adapters[agent.cli_type]
         argv = adapter.build_argv(command, project_path)
         instruction = self._build_fixed_instruction(agent)
-        env = self._build_subprocess_env()
+        env = self._build_subprocess_env(extra_env=env_vars)
         launched_at = now_iso()
 
         creationflags = CREATE_NEW_PROCESS_GROUP if sys.platform == "win32" else 0
@@ -315,8 +315,10 @@ class CliLauncher:
     def _build_fixed_instruction(self, agent: AgentDefinition) -> str:
         return FIXED_INSTRUCTION_TEMPLATE.format(agent_name=agent.name, uid=agent.uid)
 
-    def _build_subprocess_env(self) -> dict[str, str]:
+    def _build_subprocess_env(self, extra_env: dict[str, str] | None = None) -> dict[str, str]:
         env = os.environ.copy()
         env["PYTHONUTF8"] = "1"
         env["PYTHONIOENCODING"] = "utf-8"
+        if extra_env:
+            env.update(extra_env)
         return env

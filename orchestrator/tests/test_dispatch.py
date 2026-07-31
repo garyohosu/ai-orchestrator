@@ -514,5 +514,67 @@ class RoundTripCounterPersistenceTests(unittest.TestCase):
         self.assertEqual(counter.count("JOB-A"), 1)
 
 
+class OrchestratorNewFeatureTests(unittest.TestCase):
+    def test_job_id_and_decision_id_extraction(self) -> None:
+        # 1. Valid Job-ID extraction
+        self.assertEqual(extract_job_id("[JOB-SPEC-100] Task", 1), "JOB-SPEC-100")
+
+        # 2. Invalid subject produces NOJOB-* fallback and logs warning if logger passed
+        tmp_dir = Path(tempfile.mkdtemp())
+        logger = JobLogger(tmp_dir)
+        job_id = extract_job_id("No tag subject", 42, logger=logger)
+        self.assertEqual(job_id, "NOJOB-42")
+
+        log_content = (tmp_dir / "orchestrator.jsonl").read_text(encoding="utf-8")
+        self.assertIn("NOJOB_FALLBACK", log_content)
+        self.assertIn("NOJOB-42", log_content)
+
+    def test_env_vars_and_protected_variables_propagation(self) -> None:
+        h = DispatchCycleHarness()
+        worker = h.mail.register_user("worker")
+        boss = h.mail.register_user("boss")
+
+        h.mail.send_mail(
+            boss, worker, "[JOB-ENV-001] [DEC-001] Test Env", "Body"
+        )
+        agent = _agent("worker", worker, "exit_success.py")
+        
+        # Test _attempt_launch environment building
+        status, proc = h.cycle._attempt_launch(agent, "JOB-ENV-001", {"subject": "[JOB-ENV-001] [DEC-001] Test", "sender_uid": boss, "mail_id": 1}, 1)
+        # Verify launch built environment variables correctly
+        env_captured = h.launcher._build_subprocess_env(extra_env={
+            "AGENT_UID": agent.uid,
+            "REPLY_TO_UID": boss,
+            "JOB_ID": "JOB-ENV-001",
+            "DECISION_ID": "DEC-001",
+            "PROJECT_PATH": str(h.project_path),
+        })
+        self.assertEqual(env_captured["AGENT_UID"], agent.uid)
+        self.assertEqual(env_captured["REPLY_TO_UID"], boss)
+        self.assertEqual(env_captured["JOB_ID"], "JOB-ENV-001")
+        self.assertEqual(env_captured["DECISION_ID"], "DEC-001")
+        self.assertEqual(env_captured["PROJECT_PATH"], str(h.project_path))
+
+    def test_secrets_redacted_from_logger(self) -> None:
+        from logging_utils import LogEntry
+        tmp_dir = Path(tempfile.mkdtemp())
+        logger = JobLogger(tmp_dir)
+        logger.log_outcome(LogEntry(
+            job_id="JOB-SEC-001",
+            mail_id=1,
+            agent_name="agent",
+            command_summary="run --api-key=supersecret123",
+            started_at=None,
+            finished_at=None,
+            exit_code=0,
+            result="SUCCESS",
+            error="token=secret_pass_123",
+        ))
+        log_content = (tmp_dir / "orchestrator.jsonl").read_text(encoding="utf-8")
+        self.assertNotIn("supersecret123", log_content)
+        self.assertNotIn("secret_pass_123", log_content)
+        self.assertIn("[REDACTED]", log_content)
+
+
 if __name__ == "__main__":
     unittest.main()

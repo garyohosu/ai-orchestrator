@@ -93,3 +93,6 @@ class JobLogger:
 
     def log_outcome(self, entry: LogEntry) -> None:
         self._write(entry, kind="outcome")
+
+    def log_warning(self, entry: LogEntry) -> None:
+        self._write(entry, kind="warning")

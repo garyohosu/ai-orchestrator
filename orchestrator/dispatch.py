@@ -31,11 +31,24 @@ _JOB_ID_PATTERN = re.compile(r"^\[(JOB-[^\]]+)\]")
 _SAFE_JOB_ID_PATTERN = re.compile(r"^JOB-[A-Za-z0-9._-]+$")
 
 
-def extract_job_id(subject: str, fallback_mail_id: int) -> str:
+def extract_job_id(subject: str, fallback_mail_id: int, logger: JobLogger | None = None) -> str:
     match = _JOB_ID_PATTERN.match(subject or "")
     if match and _SAFE_JOB_ID_PATTERN.fullmatch(match.group(1)):
         return match.group(1)
-    return f"NOJOB-{fallback_mail_id}"
+    fallback = f"NOJOB-{fallback_mail_id}"
+    if logger is not None:
+        logger.log_warning(LogEntry(
+            job_id=fallback,
+            mail_id=fallback_mail_id,
+            agent_name=None,
+            command_summary=None,
+            started_at=None,
+            finished_at=None,
+            exit_code=None,
+            result="NOJOB_FALLBACK",
+            error=f"Subject '{subject}' does not start with [JOB-...]. Fallback to {fallback}"
+        ))
+    return fallback
 
 
 class OutcomeStatus(Enum):
@@ -410,7 +423,7 @@ class DispatchCycle:
             return None
 
         origin_mail = pending_mails[0]
-        job_id = extract_job_id(origin_mail["subject"], origin_mail["mail_id"])
+        job_id = extract_job_id(origin_mail["subject"], origin_mail["mail_id"], logger=self._logger)
 
         if self._round_trips.is_exceeded(job_id):
             self._finalize_without_notify(
@@ -675,17 +688,31 @@ class DispatchCycle:
     def _attempt_launch(
         self, agent: AgentDefinition, job_id: str, origin_mail: dict, attempt: int
     ) -> tuple[OutcomeStatus, ProcessResult | None]:
-        if not self._project_path.is_dir():
-            return OutcomeStatus.DELIVERY_FAILED, None
+        decision_id = ""
+        subj = origin_mail.get("subject", "")
+        dec_match = re.search(r"\[(DEC-[A-Za-z0-9._-]+)\]", subj)
+        if dec_match:
+            decision_id = dec_match.group(1)
+
+        env_vars = {
+            "AGENT_UID": agent.uid,
+            "REPLY_TO_UID": origin_mail.get("sender_uid", ""),
+            "JOB_ID": job_id,
+            "DECISION_ID": decision_id,
+            "PROJECT_PATH": str(self._project_path),
+        }
+        if hasattr(self._mail, "_db_path") and getattr(self._mail, "_db_path"):
+            env_vars["AGENT_MAIL_DB_PATH"] = str(getattr(self._mail, "_db_path"))
+
         try:
             try:
                 launched = self._launcher.launch(
-                    agent, job_id, origin_mail["mail_id"], self._project_path, attempt=attempt
+                    agent, job_id, origin_mail["mail_id"], self._project_path, attempt=attempt, env_vars=env_vars
                 )
             except TypeError as err:
                 # Preserve compatibility with test/dedicated launchers that
                 # implement the pre-output-capture four-argument contract.
-                if "attempt" not in str(err):
+                if "attempt" not in str(err) and "env_vars" not in str(err):
                     raise
                 launched = self._launcher.launch(
                     agent, job_id, origin_mail["mail_id"], self._project_path
