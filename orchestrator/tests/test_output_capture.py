@@ -9,11 +9,98 @@ from adapters.claude_code import ClaudeCodeCliAdapter
 from config import AgentDefinition
 from dispatch import ErrorNotifier, OutcomeStatus
 from launcher import CliLauncher, CliPathResolver
+from output_capture import StreamCapture, mask_text
 
 _STUB = Path(__file__).resolve().parent / "stubs" / "burst_output.py"
 
 
 class OutputCaptureTests(unittest.TestCase):
+    def test_common_environment_credential_assignments_are_redacted(self) -> None:
+        secret_values = (
+            "github-value",
+            "aws-value",
+            "cookie-value",
+            "api-value",
+            "json-token-value",
+            "json-secret-value",
+        )
+        text = "\n".join(
+            (
+                f"GITHUB_TOKEN={secret_values[0]}",
+                f"AWS_SECRET_ACCESS_KEY='{secret_values[1]}'",
+                f'SESSION_COOKIE_VALUE="{secret_values[2]}"',
+                f"SERVICE_API_KEY: {secret_values[3]}",
+                f'{{"GITHUB_TOKEN": "{secret_values[4]}"}}',
+                f'{{"AWS_SECRET_ACCESS_KEY":"{secret_values[5]}"}}',
+                r'{"GITHUB_TOKEN":"prefix\"json-escaped-tail"}',
+                r'GITHUB_TOKEN="prefix\"shell-escaped-tail"',
+                r"$env:GITHUB_TOKEN='prefix''powershell-single-tail'",
+                r'$env:GITHUB_TOKEN="prefix`"powershell-double-tail"',
+            )
+        )
+        masked = mask_text(text)
+        for value in secret_values:
+            self.assertNotIn(value, masked)
+        self.assertNotIn("json-escaped-tail", masked)
+        self.assertNotIn("shell-escaped-tail", masked)
+        self.assertNotIn("powershell-single-tail", masked)
+        self.assertNotIn("powershell-double-tail", masked)
+        self.assertEqual(masked.count("[REDACTED]"), 10)
+
+    def test_stream_redaction_reaches_system_alert_body(self) -> None:
+        class Mail:
+            def __init__(self): self.sent = []
+            def send_mail(self, *args): self.sent.append(args)
+
+        capture = StreamCapture(
+            stream_name="stdout",
+            output_path=None,
+            max_file_bytes=1024,
+            ring_bytes=64 * 1024,
+            logs_root=None,
+        )
+        capture.feed(b"GITHUB_TO")
+        capture.feed(
+            b'KEN=github-value\nAWS_SECRET_ACCESS_KEY=aws-value\n'
+            b'{"SESSION_COOKIE_VALUE":"cookie-value"}\n'
+        )
+        capture.feed(
+            (
+                r'{"GITHUB_TOKEN":"prefix\"json-escaped-tail"}' + "\n"
+                + r'$env:GITHUB_TOKEN="prefix`"powershell-double-tail"'
+                + "\n"
+            ).encode("utf-8")
+        )
+        artifact = capture.finish()
+        mail = Mail()
+        notifier = ErrorNotifier(mail, "UID999999")
+        from dispatch import NotificationDetail
+        detail = NotificationDetail(
+            target_agent_name="worker",
+            target_agent_uid="UID000002",
+            failed_stage="CLI",
+            reason="failed",
+            exit_code=1,
+            duration_sec=1,
+            retry_count=0,
+            last_attempt_at="now",
+            origin_mail_status="failed",
+            recommended_action="inspect",
+            stdout_tail=artifact.tail,
+            stdout_artifact=artifact.as_dict(),
+        )
+        self.assertTrue(
+            notifier.notify("JOB-SECRET", 1, "UID000001", OutcomeStatus.FAILED, detail)
+        )
+        body = mail.sent[0][3]
+        self.assertNotIn("github-value", body)
+        self.assertNotIn("aws-value", body)
+        self.assertNotIn("cookie-value", body)
+        self.assertNotIn("json-escaped-tail", body)
+        self.assertNotIn("powershell-double-tail", body)
+        self.assertIn("[REDACTED]", body)
+        self.assertIn("credential_assignment", body)
+
     def test_large_dual_stream_drains_and_detects_tail(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             logs = Path(tmp) / "logs"
@@ -59,8 +146,8 @@ class OutputCaptureTests(unittest.TestCase):
             failed_stage="CLI実行", reason="失敗", exit_code=1,
             duration_sec=1, retry_count=0, last_attempt_at="now",
             origin_mail_status="処理失敗", recommended_action="確認",
-            stdout_tail="X" * 20000,
-            stderr_tail="password=[REDACTED]" + "Y" * 20000,
+            stdout_tail=("\n\\\"" * 10000),
+            stderr_tail="password=[REDACTED]" + ("\r\\" * 10000),
         )
         self.assertTrue(notifier.notify("JOB-1", 1, "UID000001", OutcomeStatus.FAILED, detail))
         body = mail.sent[0][3]

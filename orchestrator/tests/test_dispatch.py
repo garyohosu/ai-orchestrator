@@ -665,6 +665,33 @@ class FailureClassificationTests(unittest.TestCase):
 
 
 class NotificationTests(unittest.TestCase):
+    def test_control_filter_uses_only_explicit_structured_metadata(self) -> None:
+        control = DispatchCycle._control_payload
+        self.assertIsNotNone(
+            control(
+                {
+                    "body": json.dumps(
+                        {"message_type": "SYSTEM_ALERT", "task_eligible": True}
+                    )
+                }
+            )
+        )
+        self.assertIsNotNone(
+            control(
+                {
+                    "body": json.dumps(
+                        {"message_type": "INVOCATION_ACK", "task_eligible": False}
+                    )
+                }
+            )
+        )
+        for body in (
+            "{broken",
+            json.dumps({"message_type": "TASK"}),
+            json.dumps({"message_type": "TASK", "task_eligible": True}),
+        ):
+            self.assertIsNone(control({"body": body, "subject": "[NO_REPLY]"}))
+
     def test_notification_body_contains_required_fields(self) -> None:
         h = DispatchCycleHarness(max_retries=0)
         commander = h.mail.register_user("commander")
@@ -674,15 +701,18 @@ class NotificationTests(unittest.TestCase):
         h.cycle.run_one_pass([agent])
         notification = h.mail._mails[-1]
         self.assertEqual(notification["recipient_uid"], commander)
+        payload = json.loads(notification["body"])
+        self.assertEqual(payload["message_type"], "SYSTEM_ALERT")
+        self.assertIs(payload["task_eligible"], False)
+        self.assertEqual(payload["job_id"], "JOB-A")
+        self.assertIn("failure", payload)
+        self.assertIn("evidence", payload)
         for label in (
-            "status:", "job_id:", "decision_id:", "agent_uid:", "exit_code:", "timeout_sec:",
-            "stdout_log:", "stderr_log:", "occurred_at:",
-            "invocation_id:", "cli_started_at:",
             "状態:", "依頼ID:", "元メールID:", "元の送信者UID:", "処理対象AI:",
             "処理対象UID:", "失敗段階:", "失敗理由:", "CLI終了コード:", "実行時間:",
             "再試行回数:", "最終試行日時:", "元メールの状態:", "推奨する次の対応:",
         ):
-            self.assertIn(label, notification["body"])
+            self.assertIn(label, payload["human_readable"])
 
     def test_notification_never_contains_secret_markers(self) -> None:
         h = DispatchCycleHarness(max_retries=0)
@@ -724,6 +754,75 @@ class NotificationTests(unittest.TestCase):
         self.assertEqual(outcomes[0].status, OutcomeStatus.HUMAN_REQUIRED)
         # No new mail was sent (would be mail #2); still just the original.
         self.assertEqual(h.mail.send_mail_calls, 1)
+
+    def test_system_alert_remains_unread_and_never_launches(self) -> None:
+        h = DispatchCycleHarness(max_retries=0)
+        commander = h.mail.register_user("commander")
+        worker = h.mail.register_user("worker")
+        h.mail.send_mail(commander, worker, "[JOB-ALERT] task", "b")
+        h.cycle.run_one_pass([_agent("worker", worker, "exit_fail.py")])
+        alert = h.mail._mails[-1]
+        alert_payload = json.loads(alert["body"])
+        self.assertEqual(alert_payload["message_type"], "SYSTEM_ALERT")
+        self.assertIs(alert_payload["task_eligible"], False)
+
+        commander_agent = _agent("commander", commander, "exit_success.py")
+        self.assertEqual(h.cycle.run_one_pass([commander_agent]), [])
+        self.assertTrue(h.terminal_store.is_terminal(alert["mail_id"]))
+        self.assertFalse(
+            next(
+                message["is_read"]
+                for message in h.mail._mails
+                if message["mail_id"] == alert["mail_id"]
+            )
+        )
+        self.assertIn("human_readable", alert_payload)
+        self.assertEqual(h.cycle.run_one_pass([commander_agent]), [])
+
+    def test_control_is_skipped_before_normal_task_even_with_alert_subject(self) -> None:
+        h = DispatchCycleHarness(max_retries=0)
+        sender = h.mail.register_user("sender")
+        worker = h.mail.register_user("worker")
+        control_id = h.mail.send_mail(
+            sender,
+            worker,
+            "ordinary display",
+            json.dumps(
+                {
+                    "message_type": "INVOCATION_ACK",
+                    "task_eligible": False,
+                    "status": "ACK_RECEIVED",
+                }
+            ),
+        )
+        normal_id = h.mail.send_mail(
+            sender,
+            worker,
+            "[JOB-NORMAL] [DEC-NORMAL] [NO_REPLY] this is a real task",
+            json.dumps(
+                {
+                    "message_type": "TASK",
+                    "task_eligible": True,
+                    "job_id": "JOB-NORMAL",
+                    "decision_id": "DEC-NORMAL",
+                    "invocation_id": "INV-PARENT-NORMAL",
+                    "parent_invocation_id": None,
+                    "root_invocation_id": "INV-PARENT-NORMAL",
+                    "trigger_mail_uid": 1,
+                }
+            ),
+        )
+        h.reply_after_launch(worker, sender, "[JOB-NORMAL] COMPLETED", "")
+        outcomes = h.cycle.run_one_pass(
+            [_agent("worker", worker, "exit_success.py")]
+        )
+        self.assertEqual(len(outcomes), 1)
+        self.assertEqual(outcomes[0].origin_mail_id, normal_id)
+        self.assertEqual(outcomes[0].status, OutcomeStatus.SUCCESS)
+        self.assertEqual(
+            h.terminal_store.get_status(control_id),
+            "IGNORED_CONTROL_NOTIFICATION",
+        )
 
 
 class RoundTripCapTests(unittest.TestCase):

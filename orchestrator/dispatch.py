@@ -255,19 +255,11 @@ class ErrorNotifier:
         status: OutcomeStatus,
         detail: NotificationDetail,
     ) -> str:
+        normalized_status = (
+            "TIMED_OUT" if status == OutcomeStatus.TIMEOUT else status.value
+        )
         lines = [
-            f"status: {'TIMED_OUT' if status == OutcomeStatus.TIMEOUT else status.value}",
-            f"job_id: {job_id}",
-            f"decision_id: {detail.decision_id or 'unknown'}",
-            f"invocation_id: {detail.invocation_id or 'unknown'}",
-            f"cli_started_at: {detail.launch_started_at or 'unknown'}",
-            f"agent_uid: {detail.target_agent_uid}",
-            f"exit_code: {detail.exit_code if detail.exit_code is not None else 'unknown'}",
-            f"timeout_sec: {detail.timeout_sec if detail.timeout_sec is not None else 'unknown'}",
-            f"stdout_log: {(detail.stdout_artifact or {}).get('relative_path', 'none')}",
-            f"stderr_log: {(detail.stderr_artifact or {}).get('relative_path', 'none')}",
-            f"occurred_at: {detail.last_attempt_at}",
-            f"状態: {status.value}",
+            f"状態: {normalized_status}",
             f"依頼ID: {job_id}",
             f"元メールID: {origin_mail_id}",
             f"元の送信者UID: {origin_sender_uid}",
@@ -285,21 +277,62 @@ class ErrorNotifier:
             f"stderr証跡: {detail.stderr_artifact or 'なし'}",
             f"引継ぎ回数: {detail.handoff_count}",
             f"担当履歴: {detail.visited_agents}",
-            "stdout末尾:",
-            self._bounded_tail(detail.stdout_tail),
-            "stderr末尾:",
-            self._bounded_tail(detail.stderr_tail),
+            "stdout/stderr末尾: 構造化フィールド evidence を参照",
             "",
             "推奨する次の対応:",
             detail.recommended_action,
         ]
-        return "\n".join(lines)
+        payload = {
+            "message_type": "SYSTEM_ALERT",
+            "task_eligible": False,
+            "status": normalized_status,
+            "job_id": job_id,
+            "decision_id": detail.decision_id,
+            "invocation_id": detail.invocation_id or None,
+            "origin_mail_uid": origin_mail_id,
+            "origin_sender_uid": origin_sender_uid,
+            "occurred_at": detail.last_attempt_at,
+            "cli_started_at": detail.launch_started_at or None,
+            "target_agent": {
+                "name": detail.target_agent_name,
+                "uid": detail.target_agent_uid,
+            },
+            "failure": {
+                "stage": detail.failed_stage,
+                "reason": detail.reason,
+                "exit_code": detail.exit_code,
+                "duration_sec": detail.duration_sec,
+                "retry_count": detail.retry_count,
+                "timeout_sec": detail.timeout_sec,
+                "recommended_action": detail.recommended_action,
+            },
+            "evidence": {
+                "classification": detail.classification,
+                "stdout": detail.stdout_artifact,
+                "stderr": detail.stderr_artifact,
+                "stdout_tail": self._bounded_tail(detail.stdout_tail),
+                "stderr_tail": self._bounded_tail(detail.stderr_tail),
+            },
+            "human_readable": "\n".join(lines),
+        }
+        return json.dumps(payload, ensure_ascii=False, indent=2)
 
     def _bounded_tail(self, text: str) -> str:
-        data = text.encode("utf-8")
-        if len(data) <= self._tail_bytes:
+        def serialized_size(value: str) -> int:
+            return len(json.dumps(value, ensure_ascii=False).encode("utf-8"))
+
+        if serialized_size(text) <= self._tail_bytes:
             return text
-        return "[TRUNCATED]\n" + data[-self._tail_bytes :].decode("utf-8", errors="replace")
+        prefix = "[TRUNCATED]\n"
+        low, high = 0, len(text)
+        while low < high:
+            middle = (low + high + 1) // 2
+            candidate = prefix + text[-middle:]
+            if serialized_size(candidate) <= self._tail_bytes:
+                low = middle
+            else:
+                high = middle - 1
+        return prefix + (text[-low:] if low else "")
 
 
 @dataclass(frozen=True)
@@ -456,6 +489,28 @@ class DispatchCycle:
         pending_mails = [m for m in unread_mails if not self._terminal_store.is_terminal(m["mail_id"])]
         origin_mail = None
         for candidate in pending_mails:
+            control_payload = self._control_payload(candidate)
+            if control_payload is not None:
+                self._terminal_store.mark(
+                    int(candidate["mail_id"]), "IGNORED_CONTROL_NOTIFICATION"
+                )
+                self._logger.log_outcome(
+                    LogEntry(
+                        job_id=(
+                            control_payload.get("job_id")
+                            if isinstance(control_payload.get("job_id"), str)
+                            else None
+                        ),
+                        mail_id=int(candidate["mail_id"]),
+                        agent_name=agent.name,
+                        command_summary=None,
+                        started_at=None,
+                        finished_at=now_iso(),
+                        exit_code=None,
+                        result="IGNORED_CONTROL_NOTIFICATION",
+                    )
+                )
+                continue
             delegation_key = self._delegation_key(candidate)
             if delegation_key is not None and not self._terminal_store.claim_delegation(
                 delegation_key, int(candidate["mail_id"])
@@ -692,6 +747,22 @@ class DispatchCycle:
             )
         )
         return AgentOutcome(agent, final_status, job_id, origin_mail["mail_id"])
+
+    @staticmethod
+    def _control_payload(message: dict) -> dict | None:
+        """Return structured control metadata, never using Subject as truth."""
+
+        try:
+            payload = json.loads(message.get("body", ""))
+        except (TypeError, json.JSONDecodeError):
+            return None
+        if not isinstance(payload, dict):
+            return None
+        if payload.get("message_type") == "SYSTEM_ALERT":
+            return payload
+        if payload.get("task_eligible") is False:
+            return payload
+        return None
 
     @staticmethod
     def _delegation_key(message: dict) -> str | None:

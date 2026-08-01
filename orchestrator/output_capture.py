@@ -11,6 +11,26 @@ from pathlib import Path
 _SECRET_PATTERNS = (
     ("authorization", re.compile(r"(?i)(authorization\s*:\s*bearer\s+)[^\s]+")),
     ("bearer", re.compile(r"(?i)\bbearer\s+[A-Za-z0-9._~+/=-]+")),
+    (
+        "credential_assignment",
+        re.compile(
+            r"(?i)([\"'][A-Za-z0-9_.-]{0,64}"
+            r"(?:api[_-]?key|token|secret|password|passwd|cookie)"
+            r"[A-Za-z0-9_.-]{0,64}[\"']\s*:\s*)"
+            r"(?:\"(?:\\[^\r\n]|`[^\r\n]|\"\"|[^\"\\`\r\n])*\"|"
+            r"'(?:\\[^\r\n]|`[^\r\n]|''|[^'\\`\r\n])*'|[^\s,;]+)"
+        ),
+    ),
+    (
+        "credential_assignment",
+        re.compile(
+            r"(?i)(?<![A-Za-z0-9_.-])([A-Za-z0-9_.-]{0,64}"
+            r"(?:api[_-]?key|token|secret|password|passwd|cookie)"
+            r"[A-Za-z0-9_.-]{0,64}\s*[:=]\s*)"
+            r"(?:\"(?:\\[^\r\n]|`[^\r\n]|\"\"|[^\"\\`\r\n])*\"|"
+            r"'(?:\\[^\r\n]|`[^\r\n]|''|[^'\\`\r\n])*'|[^\s,;]+)"
+        ),
+    ),
     ("api_key", re.compile(r"(?i)(api[_ -]?key\s*[:=]\s*)[^\s,;]+")),
     ("token", re.compile(r"(?i)((?:access|refresh|auth)[_ -]?token\s*[:=]\s*)[^\s,;]+")),
     ("password", re.compile(r"(?i)(password\s*[:=]\s*)[^\s,;]+")),
