@@ -9,6 +9,8 @@ import launcher as launcher_module
 from config import AgentDefinition
 from invocation import (
     InvocationIdError,
+    InvocationMetadataError,
+    derive_invocation_lineage,
     generate_invocation_id,
     resolve_launch_invocation_id,
 )
@@ -196,7 +198,9 @@ import sys
 
 data = {{
     "AI_INVOCATION_ID": os.environ.get("AI_INVOCATION_ID"),
-    "INVOCATION_ID": os.environ.get("INVOCATION_ID")
+    "INVOCATION_ID": os.environ.get("INVOCATION_ID"),
+    "AI_ROOT_INVOCATION_ID": os.environ.get("AI_ROOT_INVOCATION_ID"),
+    "AI_TRIGGER_MAIL_UID": os.environ.get("AI_TRIGGER_MAIL_UID")
 }}
 with open(r"{out_path}", "w", encoding="utf-8") as f:
     json.dump(data, f)
@@ -223,6 +227,8 @@ with open(r"{out_path}", "w", encoding="utf-8") as f:
         captured1 = json.loads(out_path.read_text(encoding="utf-8"))
         self.assertEqual(captured1["AI_INVOCATION_ID"], "INV-TEST-FIRST")
         self.assertEqual(captured1["INVOCATION_ID"], "INV-TEST-FIRST")
+        self.assertEqual(captured1["AI_ROOT_INVOCATION_ID"], "INV-TEST-FIRST")
+        self.assertEqual(captured1["AI_TRIGGER_MAIL_UID"], "1")
 
         launched2 = launcher.launch(
             agent,
@@ -236,6 +242,8 @@ with open(r"{out_path}", "w", encoding="utf-8") as f:
         captured2 = json.loads(out_path.read_text(encoding="utf-8"))
         self.assertEqual(captured2["AI_INVOCATION_ID"], "INV-TEST-SECOND")
         self.assertEqual(captured2["INVOCATION_ID"], "INV-TEST-SECOND")
+        self.assertEqual(captured2["AI_ROOT_INVOCATION_ID"], "INV-TEST-SECOND")
+        self.assertEqual(captured2["AI_TRIGGER_MAIL_UID"], "2")
         self.assertNotEqual(captured1["AI_INVOCATION_ID"], captured2["AI_INVOCATION_ID"])
 
     def test_invocation_id_generator_uses_complete_uuid4(self) -> None:
@@ -263,6 +271,60 @@ with open(r"{out_path}", "w", encoding="utf-8") as f:
                 with self.assertRaises(InvocationIdError):
                     resolve_launch_invocation_id(invalid, None, attempt=1)
 
+    def test_lineage_inherits_structured_root_or_starts_new_root(self) -> None:
+        root = derive_invocation_lineage(
+            {"mail_id": 1, "body": "plaintext [INV-NOT-CANONICAL]"},
+            "INV-NEW-ROOT",
+        )
+        self.assertIsNone(root.parent_invocation_id)
+        self.assertEqual(root.root_invocation_id, "INV-NEW-ROOT")
+        child = derive_invocation_lineage(
+            {
+                "mail_id": 2,
+                "body": json.dumps(
+                    {
+                        "invocation_id": "INV-PARENT",
+                        "parent_invocation_id": None,
+                        "root_invocation_id": "INV-ROOT",
+                        "trigger_mail_uid": 1,
+                    }
+                ),
+            },
+            "INV-CHILD",
+        )
+        self.assertEqual(child.parent_invocation_id, "INV-PARENT")
+        self.assertEqual(child.root_invocation_id, "INV-ROOT")
+        self.assertEqual(child.trigger_mail_uid, 2)
+
+    def test_structured_lineage_rejects_partial_or_malformed_metadata(self) -> None:
+        invalid_bodies = (
+            '{"invocation_id":"INV-PARENT"',
+            json.dumps({"root_invocation_id": "INV-FORGED"}),
+            json.dumps(
+                {
+                    "message_type": "TASK",
+                    "invocation_id": "INV-PARENT",
+                    "root_invocation_id": 7,
+                    "trigger_mail_uid": 1,
+                }
+            ),
+            json.dumps(
+                {
+                    "message_type": "TASK",
+                    "invocation_id": "INV-PARENT",
+                    "root_invocation_id": "INV-ROOT",
+                    "trigger_mail_uid": True,
+                }
+            ),
+        )
+        for body in invalid_bodies:
+            with self.subTest(body=body), self.assertRaises(
+                InvocationMetadataError
+            ):
+                derive_invocation_lineage(
+                    {"mail_id": 1, "body": body}, "INV-CHILD"
+                )
+
     def test_instruction_template_includes_invocation_id(self) -> None:
         out_path = self.project_path / "captured_inst.txt"
         agent = AgentDefinition(
@@ -276,6 +338,8 @@ with open(r"{out_path}", "w", encoding="utf-8") as f:
         launched.wait(timeout_sec=10)
         captured = out_path.read_text(encoding="utf-8")
         self.assertIn("Invocation-IDはINV-METADATA-123です。", captured)
+        self.assertIn("Parent-Invocation-IDはnullです", captured)
+        self.assertIn("文字列のnoneではなくJSONのnull", captured)
 
 
 class RedactCommandTests(unittest.TestCase):

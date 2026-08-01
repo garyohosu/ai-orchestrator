@@ -21,6 +21,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol
 
+from invocation import InvocationResult
+
 
 class MailPackageNotFoundError(RuntimeError):
     """The sibling mail/ package could not be found or loaded."""
@@ -33,7 +35,7 @@ class MailPort(Protocol):
     def list_users(self) -> list[dict]: ...
     def send_mail(self, sender_uid: str, recipient_uid: str, subject: str, body: str) -> int: ...
     def check_mail(self, uid: str) -> int: ...
-    def receive_mail(self, uid: str) -> list[dict]: ...
+    def receive_mail(self, uid: str, *, mail_id: int | None = None) -> list[dict]: ...
     def find_mails(
         self,
         *,
@@ -102,12 +104,12 @@ class MailModuleAdapter:
     def check_mail(self, uid: str) -> int:
         return self._module.check_mail(uid, db_path=self._db_path)
 
-    def receive_mail(self, uid: str) -> list[dict]:
+    def receive_mail(self, uid: str, *, mail_id: int | None = None) -> list[dict]:
         # SPEC.md 15章 assigns metadata retrieval for dispatch decisions to
         # find_mails (QandA Q013); this wrapper exists only because SPEC.md
         # 7章 lists receive_mail among the six allowed functions, and the
         # AI CLI process itself calls it after being launched.
-        return self._module.receive_mail(uid, db_path=self._db_path)
+        return self._module.receive_mail(uid, mail_id=mail_id, db_path=self._db_path)
 
     def find_mails(
         self,
@@ -144,6 +146,10 @@ class ExpectedReply:
     invocation_id: str = ""
     max_mail_id: int | None = None
     decision_id: str = ""
+    parent_invocation_id: str | None = None
+    root_invocation_id: str = ""
+    trigger_mail_uid: int | None = None
+    require_structured_context: bool = False
 
 
 @dataclass(frozen=True)
@@ -151,6 +157,13 @@ class ReplyCheckResult:
     found: bool
     reply_mail_id: int | None = None
     status: str | None = None
+    invocation_result: InvocationResult | None = None
+    parent_invocation_id: str | None = None
+    root_invocation_id: str | None = None
+    trigger_mail_uid: int | None = None
+    result_mail_uid: int | None = None
+    duplicate_mail_uids: tuple[int, ...] = ()
+    conflicting: bool = False
 
 
 class MailReplyQuery:
@@ -195,41 +208,31 @@ class MailReplyQuery:
         if not isinstance(body_inv, str) or not body_inv or body_inv != invocation_id:
             return False
 
-        subject_inv = None
-        subject = message.get("subject", "")
-        subj_match = re.search(
-            r"\[((?:INV|MANUAL)-[A-Za-z0-9._-]+)\]", subject
-        )
-        if subj_match:
-            subject_inv = subj_match.group(1)
-        if subject_inv and body_inv and subject_inv != body_inv:
-            return False
         return True
 
     def find_terminal_reply(self, expected: ExpectedReply) -> ReplyCheckResult:
         matches = self._mail.find_mails(
             sender_uid=expected.sender_uid,
-            recipient_uid=expected.recipient_uid,
-            request_id=expected.job_id,
             after_mail_id=expected.max_mail_id if expected.max_mail_id is not None else expected.origin_mail_id,
             sent_after=expected.not_before_iso,
             limit=None,
         )
-        terminal = {
-            "WAITING_FOR_DECISION",
-            "WAITING_FOR_WORKER",
-            "COMPLETED",
-            "FAILED",
-            "HUMAN_REQUIRED",
-            "REJECTED",
-            "CANCELLED",
-        }
+        selected: ReplyCheckResult | None = None
+        duplicate_mail_uids: list[int] = []
         for message in matches:
             if not self._invocation_matches(message, expected.invocation_id):
                 continue
             payload = self._structured_payload(message)
             assert payload is not None
-            if expected.decision_id:
+            if expected.require_structured_context and (
+                payload.get("job_id") != expected.job_id
+            ):
+                continue
+            if expected.require_structured_context:
+                body_decision_id = payload.get("decision_id")
+                if body_decision_id != expected.decision_id:
+                    continue
+            elif expected.decision_id:
                 body_decision_id = payload.get("decision_id")
                 if body_decision_id is not None:
                     if (
@@ -246,12 +249,132 @@ class MailReplyQuery:
                     )
                     if expected.decision_id not in subject_decision_ids:
                         continue
-            status = payload.get("status")
-            if not isinstance(status, str):
+            explicit_result = payload.get("invocation_result")
+            if expected.require_structured_context and explicit_result is None:
                 continue
-            if status in terminal:
-                return ReplyCheckResult(True, int(message["mail_id"]), status)
-        return ReplyCheckResult(False)
+            if explicit_result is not None:
+                if not isinstance(explicit_result, str):
+                    continue
+                try:
+                    invocation_result = InvocationResult(explicit_result)
+                except ValueError:
+                    continue
+                status = payload.get("status", invocation_result.value)
+                if not isinstance(status, str):
+                    continue
+                compatible_statuses = {
+                    InvocationResult.COMPLETED: {"COMPLETED"},
+                    InvocationResult.DELEGATED: {"DELEGATED"},
+                    InvocationResult.WAITING: {
+                        "WAITING",
+                        "WAITING_FOR_DECISION",
+                        "WAITING_FOR_WORKER",
+                    },
+                    InvocationResult.FAILED: {
+                        "FAILED",
+                        "HUMAN_REQUIRED",
+                        "REJECTED",
+                        "CANCELLED",
+                    },
+                }
+                if status not in compatible_statuses[invocation_result]:
+                    continue
+            else:
+                status = payload.get("status")
+                if not isinstance(status, str):
+                    continue
+            if explicit_result is None and status in {"COMPLETED"}:
+                invocation_result = InvocationResult.COMPLETED
+            elif explicit_result is None and status in {
+                "WAITING_FOR_DECISION",
+                "WAITING_FOR_WORKER",
+            }:
+                invocation_result = InvocationResult.WAITING
+            elif explicit_result is None and status in {
+                "FAILED",
+                "HUMAN_REQUIRED",
+                "REJECTED",
+                "CANCELLED",
+            }:
+                invocation_result = InvocationResult.FAILED
+            elif explicit_result is None:
+                continue
+
+            parent_invocation_id = payload.get("parent_invocation_id")
+            if parent_invocation_id is not None and (
+                not isinstance(parent_invocation_id, str) or not parent_invocation_id
+            ):
+                continue
+            root_invocation_id = payload.get("root_invocation_id")
+            if root_invocation_id is not None and (
+                not isinstance(root_invocation_id, str) or not root_invocation_id
+            ):
+                continue
+            trigger_mail_uid = payload.get("trigger_mail_uid")
+            if trigger_mail_uid is not None and (
+                isinstance(trigger_mail_uid, bool)
+                or not isinstance(trigger_mail_uid, int)
+                or trigger_mail_uid <= 0
+            ):
+                continue
+            if expected.require_structured_context:
+                if "parent_invocation_id" not in payload:
+                    continue
+                if parent_invocation_id != expected.parent_invocation_id:
+                    continue
+                if not isinstance(root_invocation_id, str) or not root_invocation_id:
+                    continue
+                if (
+                    isinstance(trigger_mail_uid, bool)
+                    or not isinstance(trigger_mail_uid, int)
+                    or trigger_mail_uid <= 0
+                ):
+                    continue
+            if (
+                expected.parent_invocation_id is not None
+                and parent_invocation_id != expected.parent_invocation_id
+            ):
+                continue
+            if expected.root_invocation_id and (
+                root_invocation_id != expected.root_invocation_id
+            ):
+                continue
+            if expected.trigger_mail_uid is not None and (
+                trigger_mail_uid != expected.trigger_mail_uid
+            ):
+                continue
+
+            result_mail_uid = int(message["mail_id"])
+            candidate = ReplyCheckResult(
+                True,
+                result_mail_uid,
+                status,
+                invocation_result,
+                parent_invocation_id,
+                root_invocation_id,
+                trigger_mail_uid,
+                result_mail_uid,
+            )
+            if selected is None:
+                selected = candidate
+                continue
+            duplicate_mail_uids.append(result_mail_uid)
+            # Lowest valid mail ID is authoritative. Later identical or
+            # contradictory replies are diagnostics only and never reopen it.
+        if selected is None:
+            return ReplyCheckResult(False)
+        return ReplyCheckResult(
+            selected.found,
+            selected.reply_mail_id,
+            selected.status,
+            selected.invocation_result,
+            selected.parent_invocation_id,
+            selected.root_invocation_id,
+            selected.trigger_mail_uid,
+            selected.result_mail_uid,
+            tuple(duplicate_mail_uids),
+            False,
+        )
 
     def get_origin_mail_state(self, mail_id: int, recipient_uid: str) -> dict | None:
         """Return the origin mail's own row (is_read/read_at/body/sender_uid).

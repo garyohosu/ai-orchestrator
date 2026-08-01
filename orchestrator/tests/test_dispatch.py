@@ -72,8 +72,23 @@ class DispatchCycleHarness:
 
         def patched_launch(agent, job_id, origin_mail_id, project_path, **kwargs):
             launched = original_launch(agent, job_id, origin_mail_id, project_path, **kwargs)
-            status = "WAITING_FOR_WORKER" if "WAITING_FOR_WORKER" in subject else ("WAITING_FOR_DECISION" if "WAITING_FOR_DECISION" in subject else ("ACK_RECEIVED" if "ACK" in subject else "COMPLETED"))
-            payload = {"status": status, "job_id": job_id, "invocation_id": launched.invocation_id}
+            status = "DELEGATED" if "DELEGATED" in subject else ("WAITING_FOR_WORKER" if "WAITING_FOR_WORKER" in subject else ("WAITING_FOR_DECISION" if "WAITING_FOR_DECISION" in subject else ("ACK_RECEIVED" if "ACK" in subject else "COMPLETED")))
+            env_vars = kwargs.get("env_vars", {})
+            payload = {
+                "status": status,
+                "job_id": job_id,
+                "decision_id": env_vars.get("DECISION_ID", ""),
+                "invocation_id": launched.invocation_id,
+                "parent_invocation_id": env_vars.get("AI_PARENT_INVOCATION_ID"),
+                "root_invocation_id": env_vars["AI_ROOT_INVOCATION_ID"],
+                "trigger_mail_uid": int(env_vars["AI_TRIGGER_MAIL_UID"]),
+            }
+            if status == "COMPLETED":
+                payload["invocation_result"] = "COMPLETED"
+            elif status == "DELEGATED":
+                payload["invocation_result"] = "DELEGATED"
+            elif status in {"WAITING_FOR_WORKER", "WAITING_FOR_DECISION"}:
+                payload["invocation_result"] = "WAITING"
             self.mail.send_mail(sender_uid, recipient_uid, f"{subject} [{launched.invocation_id}]", json.dumps(payload))
             return launched
 
@@ -277,6 +292,215 @@ class NoWorkAndOrderingTests(unittest.TestCase):
 
 
 class SuccessAndReplyMatchingTests(unittest.TestCase):
+    def test_invalid_structured_metadata_isolated_without_stopping_pass(self) -> None:
+        h = DispatchCycleHarness()
+        sender = h.mail.register_user("sender")
+        bad_uid = h.mail.register_user("bad-worker")
+        good_uid = h.mail.register_user("good-worker")
+        bad_id = h.mail.send_mail(
+            sender,
+            bad_uid,
+            "[JOB-BAD-METADATA] malformed task",
+            json.dumps({"message_type": "TASK", "task_eligible": True}),
+        )
+        h.mail.send_mail(sender, good_uid, "[JOB-GOOD-METADATA] task", "plain")
+        h.reply_after_launch(
+            good_uid, sender, "[JOB-GOOD-METADATA] COMPLETED", ""
+        )
+        outcomes = h.cycle.run_one_pass(
+            [
+                _agent("bad-worker", bad_uid, "exit_success.py"),
+                _agent("good-worker", good_uid, "exit_success.py"),
+            ]
+        )
+        self.assertEqual(
+            [outcome.status for outcome in outcomes],
+            [OutcomeStatus.HUMAN_REQUIRED, OutcomeStatus.SUCCESS],
+        )
+        self.assertTrue(h.terminal_store.is_terminal(bad_id))
+
+    def test_duplicate_delegated_task_launches_child_only_once(self) -> None:
+        h = DispatchCycleHarness()
+        director = h.mail.register_user("director")
+        reviewer = h.mail.register_user("reviewer")
+        payload = {
+            "message_type": "DECISION_REQUEST",
+            "task_eligible": True,
+            "status": "DELEGATED",
+            "invocation_result": "DELEGATED",
+            "job_id": "JOB-DUP-DELEGATE",
+            "decision_id": "DEC-DUP-DELEGATE",
+            "invocation_id": "INV-DIRECTOR-DELEGATE",
+            "parent_invocation_id": "INV-ROOT-DELEGATE",
+            "root_invocation_id": "INV-ROOT-DELEGATE",
+            "trigger_mail_uid": 1,
+        }
+        first_id = h.mail.send_mail(
+            director,
+            reviewer,
+            "[JOB-DUP-DELEGATE] [DEC-DUP-DELEGATE] DECISION_REQUEST",
+            json.dumps(payload),
+        )
+        second_id = h.mail.send_mail(
+            director,
+            reviewer,
+            "[JOB-DUP-DELEGATE] [DEC-DUP-DELEGATE] DECISION_REQUEST",
+            json.dumps(payload),
+        )
+        h.reply_after_launch(
+            reviewer,
+            director,
+            "[JOB-DUP-DELEGATE] COMPLETED",
+            "",
+        )
+        agent = _agent("reviewer", reviewer, "exit_success.py")
+        first = h.cycle.run_one_pass([agent])
+        self.assertEqual(len(first), 1)
+        self.assertEqual(first[0].status, OutcomeStatus.SUCCESS)
+        self.assertEqual(first[0].origin_mail_id, first_id)
+        self.assertEqual(h.cycle.run_one_pass([agent]), [])
+        self.assertEqual(
+            h.terminal_store.get_status(second_id),
+            "DUPLICATE_DELEGATED_RESULT",
+        )
+
+    def test_third_party_delegation_is_successful_invocation_result(self) -> None:
+        h = DispatchCycleHarness()
+        originator = h.mail.register_user("originator")
+        director = h.mail.register_user("director")
+        reviewer = h.mail.register_user("reviewer")
+        origin_id = h.mail.send_mail(
+            originator, director, "[JOB-DELEGATED] [DEC-D] question", "{}"
+        )
+        h.reply_after_launch(
+            director,
+            reviewer,
+            "[JOB-DELEGATED] [DEC-D] DELEGATED DECISION_REQUEST",
+            "",
+        )
+        outcome = h.cycle.run_one_pass(
+            [_agent("director", director, "exit_success.py")]
+        )[0]
+        self.assertEqual(outcome.status, OutcomeStatus.SUCCESS)
+        self.assertEqual(h.terminal_store.get_status(origin_id), "DELEGATED")
+
+    def test_result_visible_at_timeout_edge_wins_during_final_grace(self) -> None:
+        h = DispatchCycleHarness()
+        originator = h.mail.register_user("originator")
+        worker = h.mail.register_user("worker")
+        third_party = h.mail.register_user("third-party")
+        h.mail.send_mail(
+            originator, worker, "[JOB-EDGE] [DEC-EDGE] request", "{}"
+        )
+        original_launch = h.cycle._launcher.launch
+
+        def patched_launch(agent, job_id, origin_mail_id, project_path, **kwargs):
+            launched = original_launch(
+                agent, job_id, origin_mail_id, project_path, **kwargs
+            )
+            original_wait = launched.wait
+
+            def timeout_edge_wait(timeout_sec, **wait_kwargs):
+                base = original_wait(10, terminal_reply_check=None)
+                env_vars = kwargs["env_vars"]
+                h.mail.send_mail(
+                    worker,
+                    third_party,
+                    "edge result",
+                    json.dumps(
+                        {
+                            "status": "DELEGATED",
+                            "invocation_result": "DELEGATED",
+                            "job_id": job_id,
+                            "decision_id": env_vars["DECISION_ID"],
+                            "invocation_id": launched.invocation_id,
+                            "parent_invocation_id": env_vars.get(
+                                "AI_PARENT_INVOCATION_ID"
+                            ),
+                            "root_invocation_id": env_vars[
+                                "AI_ROOT_INVOCATION_ID"
+                            ],
+                            "trigger_mail_uid": int(
+                                env_vars["AI_TRIGGER_MAIL_UID"]
+                            ),
+                        }
+                    ),
+                )
+                return ProcessResult(
+                    exit_code=None,
+                    timed_out=True,
+                    duration_sec=base.duration_sec,
+                    invocation_id=launched.invocation_id,
+                    launch_started_at=launched.launched_at_iso,
+                )
+
+            launched.wait = timeout_edge_wait
+            return launched
+
+        h.cycle._launcher.launch = patched_launch
+        outcome = h.cycle.run_one_pass(
+            [_agent("worker", worker, "exit_success.py")]
+        )[0]
+        self.assertEqual(outcome.status, OutcomeStatus.SUCCESS)
+
+    def test_late_result_does_not_reopen_finalized_timeout(self) -> None:
+        h = DispatchCycleHarness()
+        h.cycle._terminal_grace_sec = 0
+        originator = h.mail.register_user("originator")
+        worker = h.mail.register_user("worker")
+        origin_id = h.mail.send_mail(
+            originator, worker, "[JOB-LATE] [DEC-LATE] request", "{}"
+        )
+        captured: dict[str, object] = {}
+        original_launch = h.cycle._launcher.launch
+
+        def patched_launch(agent, job_id, origin_mail_id, project_path, **kwargs):
+            launched = original_launch(
+                agent, job_id, origin_mail_id, project_path, **kwargs
+            )
+            original_wait = launched.wait
+            captured.update(kwargs["env_vars"])
+            captured["invocation_id"] = launched.invocation_id
+
+            def timed_out_wait(timeout_sec, **wait_kwargs):
+                base = original_wait(10, terminal_reply_check=None)
+                return ProcessResult(
+                    exit_code=None,
+                    timed_out=True,
+                    duration_sec=base.duration_sec,
+                    invocation_id=launched.invocation_id,
+                    launch_started_at=launched.launched_at_iso,
+                )
+
+            launched.wait = timed_out_wait
+            return launched
+
+        h.cycle._launcher.launch = patched_launch
+        agent = _agent("worker", worker, "exit_success.py")
+        first = h.cycle.run_one_pass([agent])[0]
+        self.assertEqual(first.status, OutcomeStatus.TIMEOUT)
+        h.mail.send_mail(
+            worker,
+            originator,
+            "late result",
+            json.dumps(
+                {
+                    "status": "COMPLETED",
+                    "invocation_result": "COMPLETED",
+                    "job_id": "JOB-LATE",
+                    "decision_id": "DEC-LATE",
+                    "invocation_id": captured["invocation_id"],
+                    "parent_invocation_id": captured.get(
+                        "AI_PARENT_INVOCATION_ID"
+                    ),
+                    "root_invocation_id": captured["AI_ROOT_INVOCATION_ID"],
+                    "trigger_mail_uid": int(captured["AI_TRIGGER_MAIL_UID"]),
+                }
+            ),
+        )
+        self.assertEqual(h.cycle.run_one_pass([agent]), [])
+        self.assertEqual(h.terminal_store.get_status(origin_id), "TIMEOUT")
+
     def test_success_when_cli_exits_zero_and_reply_matches(self) -> None:
         h = DispatchCycleHarness()
         commander = h.mail.register_user("commander")
@@ -324,7 +548,17 @@ class SuccessAndReplyMatchingTests(unittest.TestCase):
             launched = original_launch(agent, job_id, origin_mail_id, project_path, **kwargs)
             reply_id = h.mail.send_mail(worker, commander, "[JOB-A] 完了報告", "done")
             h.mail._mails[-1]["subject"] += f" [{launched.invocation_id}]"
-            h.mail._mails[-1]["body"] = json.dumps({"status": "COMPLETED", "job_id": job_id, "invocation_id": launched.invocation_id})
+            env_vars = kwargs["env_vars"]
+            h.mail._mails[-1]["body"] = json.dumps({
+                "status": "COMPLETED",
+                "invocation_result": "COMPLETED",
+                "job_id": job_id,
+                "decision_id": env_vars.get("DECISION_ID", ""),
+                "invocation_id": launched.invocation_id,
+                "parent_invocation_id": env_vars.get("AI_PARENT_INVOCATION_ID"),
+                "root_invocation_id": env_vars["AI_ROOT_INVOCATION_ID"],
+                "trigger_mail_uid": int(env_vars["AI_TRIGGER_MAIL_UID"]),
+            })
             h.mail.seed_sent_at(reply_id, launched.launched_at_iso)
             return launched
 

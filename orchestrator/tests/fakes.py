@@ -64,14 +64,18 @@ class InMemoryMailAdapter:
             raise ValueError(f"unknown uid: {uid}")
         return sum(1 for m in self._mails if m["recipient_uid"] == uid and not m["is_read"])
 
-    def receive_mail(self, uid: str) -> list[dict]:
+    def receive_mail(self, uid: str, *, mail_id: int | None = None) -> list[dict]:
         self.receive_mail_calls += 1
         if uid not in self._users:
             raise ValueError(f"unknown uid: {uid}")
         result = []
         read_at = now_iso()
         for mail in self._mails:
-            if mail["recipient_uid"] == uid and not mail["is_read"]:
+            if (
+                mail["recipient_uid"] == uid
+                and not mail["is_read"]
+                and (mail_id is None or mail["mail_id"] == mail_id)
+            ):
                 mail["is_read"] = True
                 mail["read_at"] = read_at
                 result.append(

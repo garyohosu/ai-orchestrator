@@ -183,8 +183,17 @@ def _run_stale_recovery(ctx: OrchestratorContext) -> list:
                     result="STALE_REQUEUE_ORIGIN_NOT_FOUND" if unusual else "STALE_REQUEUE",
                 )
             )
-        elif action.kind == RecoveryActionKind.MARK_COMPLETED:
-            ctx.terminal_store.mark(state.origin_mail_id, OutcomeStatus.SUCCESS.value)
+        elif action.kind in {
+            RecoveryActionKind.MARK_RESULT,
+            RecoveryActionKind.MARK_COMPLETED,
+        }:
+            invocation_result = action.invocation_result or "COMPLETED"
+            recovered_status = (
+                OutcomeStatus.FAILED
+                if invocation_result == "FAILED"
+                else OutcomeStatus.SUCCESS
+            )
+            ctx.terminal_store.mark(state.origin_mail_id, invocation_result)
             ctx.logger.log_outcome(
                 LogEntry(
                     job_id=state.job_id,
@@ -194,9 +203,20 @@ def _run_stale_recovery(ctx: OrchestratorContext) -> list:
                     started_at=None,
                     finished_at=now_iso(),
                     exit_code=None,
-                    result="STALE_MARK_COMPLETED",
+                    result=f"STALE_{recovered_status.value}",
+                    invocation_id=state.invocation_id,
+                    parent_invocation_id=state.parent_invocation_id,
+                    root_invocation_id=state.root_invocation_id,
+                    trigger_mail_uid=state.trigger_mail_uid,
+                    result_mail_uid=action.result_mail_uid or action.reply_mail_id,
+                    invocation_result=invocation_result,
+                    duplicate_mail_uids=action.duplicate_mail_uids,
                 )
             )
+            for duplicate_mail_uid in action.duplicate_mail_uids:
+                ctx.terminal_store.mark(
+                    duplicate_mail_uid, "DUPLICATE_INVOCATION_RESULT"
+                )
         elif action.kind == RecoveryActionKind.NOTIFY_ORIGIN_SENDER:
             detail = NotificationDetail(
                 target_agent_name=state.agent_name,

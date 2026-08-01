@@ -57,12 +57,19 @@ FIXED_INSTRUCTION_TEMPLATE = (
     "あなたは{agent_name}です。\n"
     "UIDは{uid}です。\n"
     "Invocation-IDは{invocation_id}です。\n"
+    "Parent-Invocation-IDは{parent_invocation_id}です（rootではJSON nullです）。\n"
+    "Root-Invocation-IDは{root_invocation_id}です。\n"
+    "Trigger-Mail-UIDは{trigger_mail_uid}です。\n"
     "\n"
     "プロジェクト内のmailパッケージを使い、自分宛ての未読メールを確認してください。\n"
     "引継ぎ情報がある場合は確認してください。\n"
     "メールの指示を実行し、指定された宛先へ結果をメールしてください。\n"
     "Blocking質問を作成した場合は、QandA.md更新・質問メール送信・agent_reply.py wait --result-file の実行後、WAITING_FOR_DECISIONを報告して終了してください。\n"
     "WAITING_FOR_DECISIONを送信した後、同じCLIプロセス内で回答を待ったり追加作業を続けたりしてはいけません。\n"
+    "QUESTIONを含むすべての結果メール本文をJSON objectにし、message_type、task_eligible、job_id、decision_id、上記Invocation-ID、parent_invocation_id、root_invocation_id、trigger_mail_uidを正確に含めてください。\n"
+    "QUESTIONメールはmessage_typeをQUESTION、task_eligibleをtrueにしてください。ACKはmessage_typeをINVOCATION_ACK、task_eligibleをfalseにしてください。\n"
+    "parent_invocation_idがrootを表す場合、文字列のnoneではなくJSONのnullを使用してください。\n"
+    "終端結果にはinvocation_resultをCOMPLETED/DELEGATED/WAITING/FAILEDのいずれかで含めてください。\n"
     "処理対象がなくなったら終了してください。\n"
 )
 
@@ -108,8 +115,25 @@ class ProcessResult:
     cli_evidence: CliEvidence = CliEvidence()
     terminal_status: str | None = None
     terminal_mail_id: int | None = None
+    invocation_result: str | None = None
+    parent_invocation_id: str | None = None
+    root_invocation_id: str | None = None
+    trigger_mail_uid: int | None = None
+    result_mail_uid: int | None = None
+    duplicate_mail_uids: tuple[int, ...] = ()
     invocation_id: str = ""
     launch_started_at: str = ""
+
+
+@dataclass(frozen=True)
+class TerminalDetection:
+    status: str
+    result_mail_uid: int
+    invocation_result: str | None = None
+    parent_invocation_id: str | None = None
+    root_invocation_id: str | None = None
+    trigger_mail_uid: int | None = None
+    duplicate_mail_uids: tuple[int, ...] = ()
 
 
 class LaunchedProcess:
@@ -200,12 +224,29 @@ class LaunchedProcess:
         self._start_capture()
         terminal_status = None
         terminal_mail_id = None
+        invocation_result = None
+        parent_invocation_id = None
+        root_invocation_id = None
+        trigger_mail_uid = None
+        result_mail_uid = None
+        duplicate_mail_uids: tuple[int, ...] = ()
         deadline = started + timeout_sec
         while True:
             if terminal_reply_check is not None:
                 detected = terminal_reply_check()
                 if detected is not None:
-                    terminal_status, terminal_mail_id = detected
+                    if isinstance(detected, TerminalDetection):
+                        terminal_status = detected.status
+                        terminal_mail_id = detected.result_mail_uid
+                        invocation_result = detected.invocation_result
+                        parent_invocation_id = detected.parent_invocation_id
+                        root_invocation_id = detected.root_invocation_id
+                        trigger_mail_uid = detected.trigger_mail_uid
+                        result_mail_uid = detected.result_mail_uid
+                        duplicate_mail_uids = detected.duplicate_mail_uids
+                    else:
+                        # Compatibility with dedicated test launchers/callbacks.
+                        terminal_status, terminal_mail_id = detected[:2]
                     grace_deadline = time.monotonic() + terminal_grace_sec
                     while self._popen.poll() is None and time.monotonic() < grace_deadline:
                         time.sleep(min(0.1, max(0.0, grace_deadline - time.monotonic())))
@@ -255,6 +296,12 @@ class LaunchedProcess:
             cli_evidence=evidence,
             terminal_status=terminal_status,
             terminal_mail_id=terminal_mail_id,
+            invocation_result=invocation_result,
+            parent_invocation_id=parent_invocation_id,
+            root_invocation_id=root_invocation_id,
+            trigger_mail_uid=trigger_mail_uid,
+            result_mail_uid=result_mail_uid,
+            duplicate_mail_uids=duplicate_mail_uids,
             invocation_id=self.invocation_id,
             launch_started_at=self.launched_at_iso,
         )
@@ -291,10 +338,18 @@ class CliLauncher:
         launch_env = dict(env_vars or {})
         launch_env["AI_INVOCATION_ID"] = invocation_id
         launch_env["INVOCATION_ID"] = invocation_id
+        launch_env.setdefault("AI_ROOT_INVOCATION_ID", invocation_id)
+        launch_env.setdefault("AI_TRIGGER_MAIL_UID", str(origin_mail_id))
         command = self._resolver.resolve(agent)
         adapter = self._adapters[agent.cli_type]
         argv = adapter.build_argv(command, project_path)
-        instruction = self._build_fixed_instruction(agent, invocation_id=invocation_id)
+        instruction = self._build_fixed_instruction(
+            agent,
+            invocation_id=invocation_id,
+            parent_invocation_id=launch_env.get("AI_PARENT_INVOCATION_ID", "null"),
+            root_invocation_id=launch_env.get("AI_ROOT_INVOCATION_ID", invocation_id),
+            trigger_mail_uid=launch_env.get("AI_TRIGGER_MAIL_UID", "unknown"),
+        )
         env = self._build_subprocess_env(extra_env=launch_env)
         launched_at = now_iso()
 
@@ -358,9 +413,21 @@ class CliLauncher:
         launched._start_capture()
         return launched
 
-    def _build_fixed_instruction(self, agent: AgentDefinition, invocation_id: str = "") -> str:
+    def _build_fixed_instruction(
+        self,
+        agent: AgentDefinition,
+        invocation_id: str = "",
+        parent_invocation_id: str = "null",
+        root_invocation_id: str = "",
+        trigger_mail_uid: str = "unknown",
+    ) -> str:
         return FIXED_INSTRUCTION_TEMPLATE.format(
-            agent_name=agent.name, uid=agent.uid, invocation_id=invocation_id
+            agent_name=agent.name,
+            uid=agent.uid,
+            invocation_id=invocation_id,
+            parent_invocation_id=parent_invocation_id,
+            root_invocation_id=root_invocation_id or invocation_id,
+            trigger_mail_uid=trigger_mail_uid,
         )
 
     def _build_subprocess_env(self, extra_env: dict[str, str] | None = None) -> dict[str, str]:

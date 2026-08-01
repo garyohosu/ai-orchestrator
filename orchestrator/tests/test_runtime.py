@@ -10,6 +10,7 @@ from runtime import (
     RecoveryActionKind,
     RunDurationGuard,
     RunningAgentState,
+    RuntimeStateError,
     RuntimeStateStore,
     StaleRecoveryService,
     StopController,
@@ -68,12 +69,21 @@ class RuntimeStateStoreTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.store.save(state)
 
-    def test_corrupt_file_is_skipped_not_fatal(self) -> None:
+    def test_corrupt_file_fails_closed(self) -> None:
         self.store.save(self._state("JOB-good"))
         bad_path = self.store._runtime_dir / "running-JOB-bad.json"
         bad_path.write_text("{not json", encoding="utf-8")
-        loaded = self.store.load_all()
-        self.assertEqual([s.job_id for s in loaded], ["JOB-good"])
+        with self.assertRaises(RuntimeStateError):
+            self.store.load_all()
+
+    def test_wrong_runtime_field_types_fail_closed(self) -> None:
+        path = self.store._runtime_dir / "running-JOB-bad.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        data = self._state("JOB-bad").to_dict()
+        data["pid"] = True
+        path.write_text(__import__("json").dumps(data), encoding="utf-8")
+        with self.assertRaises(RuntimeStateError):
+            self.store.load_all()
 
 
 class TerminalStateStoreTests(unittest.TestCase):
@@ -89,6 +99,22 @@ class TerminalStateStoreTests(unittest.TestCase):
         TerminalStateStore(runtime_dir).mark(7, "FAILED")
         reopened = TerminalStateStore(runtime_dir)
         self.assertTrue(reopened.is_terminal(7))
+
+    def test_corrupt_terminal_index_fails_closed(self) -> None:
+        runtime_dir = Path(tempfile.mkdtemp())
+        (runtime_dir / "terminal_mail_ids.json").write_text(
+            "{bad json", encoding="utf-8"
+        )
+        with self.assertRaises(RuntimeStateError):
+            TerminalStateStore(runtime_dir).is_terminal(1)
+
+    def test_delegation_claim_survives_restart_and_rejects_other_mail(self) -> None:
+        runtime_dir = Path(tempfile.mkdtemp())
+        store = TerminalStateStore(runtime_dir)
+        self.assertTrue(store.claim_delegation("key", 10))
+        reopened = TerminalStateStore(runtime_dir)
+        self.assertTrue(reopened.claim_delegation("key", 10))
+        self.assertFalse(reopened.claim_delegation("key", 11))
 
 
 class RunDurationGuardTests(unittest.TestCase):
@@ -209,7 +235,7 @@ class StaleRecoveryServiceTests(unittest.TestCase):
         self.assertEqual(actions[0].kind, RecoveryActionKind.NOTIFY_ORIGIN_SENDER)
         self.assertEqual(actions[0].reply_to_uid, self.commander)
 
-    def test_read_with_reply_yields_mark_completed(self) -> None:
+    def test_read_with_reply_yields_mark_result(self) -> None:
         origin_id = self.mail.send_mail(self.commander, self.worker, "[JOB-A] 依頼", "b")
         self.mail.receive_mail(self.worker)
         # recorded_at_iso (set inside _save_state, below) must predate the
@@ -219,7 +245,29 @@ class StaleRecoveryServiceTests(unittest.TestCase):
         self._save_state(pid=999_999, start_time="2000-01-01T00:00:00.000Z", origin_mail_id=origin_id)
         self.mail.send_mail(self.worker, self.commander, "[JOB-A] [INV-TEST-001] 完了報告", '{"status":"COMPLETED","job_id":"JOB-A","invocation_id":"INV-TEST-001"}')
         actions = self.service.recover_on_startup()
-        self.assertEqual(actions[0].kind, RecoveryActionKind.MARK_COMPLETED)
+        self.assertEqual(actions[0].kind, RecoveryActionKind.MARK_RESULT)
+        self.assertEqual(actions[0].invocation_result, "COMPLETED")
+
+    def test_read_with_failed_reply_preserves_failed_invocation_result(self) -> None:
+        origin_id = self.mail.send_mail(
+            self.commander, self.worker, "[JOB-A] request", "b"
+        )
+        self.mail.receive_mail(self.worker)
+        self._save_state(
+            pid=999_999,
+            start_time="2000-01-01T00:00:00.000Z",
+            origin_mail_id=origin_id,
+        )
+        self.mail.send_mail(
+            self.worker,
+            self.commander,
+            "failed",
+            '{"status":"FAILED","job_id":"JOB-A",'
+            '"invocation_id":"INV-TEST-001"}',
+        )
+        actions = self.service.recover_on_startup()
+        self.assertEqual(actions[0].kind, RecoveryActionKind.MARK_RESULT)
+        self.assertEqual(actions[0].invocation_result, "FAILED")
 
     def test_old_reply_below_origin_mail_id_does_not_mark_completed(self) -> None:
         stale_reply_id = self.mail.send_mail(self.worker, self.commander, "[JOB-A] 前の返信", "old")

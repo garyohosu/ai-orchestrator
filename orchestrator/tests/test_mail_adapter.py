@@ -1,3 +1,4 @@
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -10,6 +11,7 @@ from mail_adapter import (
     ReplyVerifier,
     resolve_reply_to_uid,
 )
+from invocation import InvocationResult
 from tests.fakes import InMemoryMailAdapter
 from timeutil import now_iso, shift_ms
 
@@ -210,7 +212,7 @@ class MailReplyQueryTests(unittest.TestCase):
         self.mail.send_mail(self.worker, self.commander, "[JOB-A] [DEC-1] [INV-MATCH] STATUS: COMPLETED", '{"status":"COMPLETED","invocation_id":"INV-MATCH"}')
         self.assertTrue(self.query.find_terminal_reply(expected).found)
 
-    def test_terminal_reply_rejects_subject_body_mismatch(self) -> None:
+    def test_terminal_reply_rejects_body_mismatch_even_when_subject_matches(self) -> None:
         origin_id = self.mail.send_mail(self.commander, self.worker, "[JOB-A] [DEC-1] request", "b")
         # Subject specifies INV-A, but body JSON specifies INV-B (Should be ignored as a mismatch)
         self.mail.send_mail(self.worker, self.commander, "[JOB-A] [DEC-1] [INV-A] STATUS: COMPLETED", '{"status":"COMPLETED","invocation_id":"INV-B"}')
@@ -220,6 +222,30 @@ class MailReplyQueryTests(unittest.TestCase):
             invocation_id="INV-A", max_mail_id=origin_id, decision_id="DEC-1",
         )
         self.assertFalse(self.query.find_terminal_reply(expected).found)
+
+    def test_terminal_reply_ignores_wrong_subject_invocation_when_body_matches(self) -> None:
+        origin_id = self.mail.send_mail(
+            self.commander, self.worker, "[JOB-A] [DEC-1] request", "b"
+        )
+        accepted_id = self.mail.send_mail(
+            self.worker,
+            self.commander,
+            "[JOB-A] [DEC-1] [INV-WRONG-DISPLAY] STATUS: COMPLETED",
+            '{"status":"COMPLETED","invocation_id":"INV-CANONICAL"}',
+        )
+        expected = ExpectedReply(
+            job_id="JOB-A",
+            sender_uid=self.worker,
+            recipient_uid=self.commander,
+            origin_mail_id=origin_id,
+            not_before_iso=shift_ms(now_iso(), -60_000),
+            invocation_id="INV-CANONICAL",
+            max_mail_id=origin_id,
+            decision_id="DEC-1",
+        )
+        result = self.query.find_terminal_reply(expected)
+        self.assertTrue(result.found)
+        self.assertEqual(result.result_mail_uid, accepted_id)
 
     def test_terminal_reply_uses_structured_status_as_truth(self) -> None:
         origin_id = self.mail.send_mail(
@@ -284,6 +310,199 @@ class MailReplyQueryTests(unittest.TestCase):
             invocation_id="",
             max_mail_id=origin_id,
             decision_id="DEC-1",
+        )
+        self.assertFalse(self.query.find_terminal_reply(expected).found)
+
+    def test_structured_delegated_result_can_target_third_party(self) -> None:
+        origin_id = self.mail.send_mail(
+            self.commander, self.worker, "[JOB-D] [DEC-D] question", "{}"
+        )
+        third_party = self.mail.register_user("third-party")
+        result_id = self.mail.send_mail(
+            self.worker,
+            third_party,
+            "display text without canonical tags",
+            '{"message_type":"DECISION_REQUEST","task_eligible":true,'
+            '"status":"DELEGATED","invocation_result":"DELEGATED",'
+            '"job_id":"JOB-D","decision_id":"DEC-D",'
+            '"invocation_id":"INV-DIRECTOR","parent_invocation_id":"INV-WORKER",'
+            '"root_invocation_id":"INV-ROOT","trigger_mail_uid":1}',
+        )
+        expected = ExpectedReply(
+            job_id="JOB-D",
+            sender_uid=self.worker,
+            recipient_uid=self.commander,
+            origin_mail_id=origin_id,
+            not_before_iso=shift_ms(now_iso(), -60_000),
+            invocation_id="INV-DIRECTOR",
+            max_mail_id=origin_id,
+            decision_id="DEC-D",
+            parent_invocation_id="INV-WORKER",
+            root_invocation_id="INV-ROOT",
+            trigger_mail_uid=origin_id,
+            require_structured_context=True,
+        )
+        result = self.query.find_terminal_reply(expected)
+        self.assertTrue(result.found)
+        self.assertEqual(result.invocation_result, InvocationResult.DELEGATED)
+        self.assertEqual(result.result_mail_uid, result_id)
+
+    def test_duplicate_structured_results_use_lowest_mail_id(self) -> None:
+        origin_id = self.mail.send_mail(
+            self.commander, self.worker, "[JOB-DUP] [DEC-DUP] request", "{}"
+        )
+        payload = json.dumps(
+            {
+                "status": "COMPLETED",
+                "invocation_result": "COMPLETED",
+                "job_id": "JOB-DUP",
+                "decision_id": "DEC-DUP",
+                "invocation_id": "INV-DUP",
+                "parent_invocation_id": None,
+                "root_invocation_id": "INV-DUP",
+                "trigger_mail_uid": origin_id,
+            }
+        )
+        first = self.mail.send_mail(self.worker, self.commander, "first", payload)
+        second = self.mail.send_mail(self.worker, self.commander, "second", payload)
+        expected = ExpectedReply(
+            job_id="JOB-DUP",
+            sender_uid=self.worker,
+            recipient_uid=self.commander,
+            origin_mail_id=origin_id,
+            not_before_iso=shift_ms(now_iso(), -60_000),
+            invocation_id="INV-DUP",
+            max_mail_id=origin_id,
+            decision_id="DEC-DUP",
+            parent_invocation_id=None,
+            root_invocation_id="INV-DUP",
+            trigger_mail_uid=origin_id,
+            require_structured_context=True,
+        )
+        result = self.query.find_terminal_reply(expected)
+        self.assertEqual(result.result_mail_uid, first)
+        self.assertEqual(result.duplicate_mail_uids, (second,))
+
+    def test_structured_result_rejects_wrong_correlation_fields(self) -> None:
+        origin_id = self.mail.send_mail(
+            self.commander, self.worker, "[JOB-S] [DEC-S] request", "{}"
+        )
+        base = {
+            "status": "COMPLETED",
+            "invocation_result": "COMPLETED",
+            "job_id": "JOB-S",
+            "decision_id": "DEC-S",
+            "invocation_id": "INV-S",
+            "parent_invocation_id": None,
+            "root_invocation_id": "INV-S",
+            "trigger_mail_uid": origin_id,
+        }
+        expected = ExpectedReply(
+            job_id="JOB-S",
+            sender_uid=self.worker,
+            recipient_uid=self.commander,
+            origin_mail_id=origin_id,
+            not_before_iso=shift_ms(now_iso(), -60_000),
+            invocation_id="INV-S",
+            max_mail_id=origin_id,
+            decision_id="DEC-S",
+            parent_invocation_id=None,
+            root_invocation_id="INV-S",
+            trigger_mail_uid=origin_id,
+            require_structured_context=True,
+        )
+        wrong_values = {
+            "job_id": "JOB-WRONG",
+            "decision_id": "DEC-WRONG",
+            "invocation_id": "INV-WRONG",
+            "parent_invocation_id": "INV-FORGED-PARENT",
+            "root_invocation_id": "INV-WRONG-ROOT",
+            "trigger_mail_uid": origin_id + 100,
+        }
+        for field, value in wrong_values.items():
+            with self.subTest(field=field):
+                payload = dict(base)
+                payload[field] = value
+                mail_id = self.mail.send_mail(
+                    self.worker, self.commander, f"wrong {field}", json.dumps(payload)
+                )
+                self.assertFalse(self.query.find_terminal_reply(expected).found)
+                self.mail._mails[-1]["is_read"] = True
+                self.assertEqual(self.mail._mails[-1]["mail_id"], mail_id)
+
+    def test_structured_root_result_requires_empty_decision_id_key(self) -> None:
+        origin_id = self.mail.send_mail(
+            self.commander, self.worker, "[JOB-ROOT] request", "plain task"
+        )
+        payload = {
+            "status": "COMPLETED",
+            "invocation_result": "COMPLETED",
+            "job_id": "JOB-ROOT",
+            "invocation_id": "INV-ROOT-RESULT",
+            "parent_invocation_id": None,
+            "root_invocation_id": "INV-ROOT-RESULT",
+            "trigger_mail_uid": origin_id,
+        }
+        expected = ExpectedReply(
+            job_id="JOB-ROOT",
+            sender_uid=self.worker,
+            recipient_uid="",
+            origin_mail_id=origin_id,
+            not_before_iso=shift_ms(now_iso(), -60_000),
+            invocation_id="INV-ROOT-RESULT",
+            max_mail_id=origin_id,
+            decision_id="",
+            parent_invocation_id=None,
+            root_invocation_id="INV-ROOT-RESULT",
+            trigger_mail_uid=origin_id,
+            require_structured_context=True,
+        )
+        self.mail.send_mail(
+            self.worker, self.commander, "missing decision", json.dumps(payload)
+        )
+        self.assertFalse(self.query.find_terminal_reply(expected).found)
+        payload["decision_id"] = ""
+        accepted = self.mail.send_mail(
+            self.worker, self.commander, "empty decision", json.dumps(payload)
+        )
+        result = self.query.find_terminal_reply(expected)
+        self.assertTrue(result.found)
+        self.assertEqual(result.result_mail_uid, accepted)
+
+    def test_structured_result_rejects_status_result_contradiction(self) -> None:
+        origin_id = self.mail.send_mail(
+            self.commander, self.worker, "[JOB-C] [DEC-C] request", "{}"
+        )
+        self.mail.send_mail(
+            self.worker,
+            self.commander,
+            "contradiction",
+            json.dumps(
+                {
+                    "status": "FAILED",
+                    "invocation_result": "DELEGATED",
+                    "job_id": "JOB-C",
+                    "decision_id": "DEC-C",
+                    "invocation_id": "INV-C",
+                    "parent_invocation_id": None,
+                    "root_invocation_id": "INV-C",
+                    "trigger_mail_uid": origin_id,
+                }
+            ),
+        )
+        expected = ExpectedReply(
+            job_id="JOB-C",
+            sender_uid=self.worker,
+            recipient_uid=self.commander,
+            origin_mail_id=origin_id,
+            not_before_iso=shift_ms(now_iso(), -60_000),
+            invocation_id="INV-C",
+            max_mail_id=origin_id,
+            decision_id="DEC-C",
+            parent_invocation_id=None,
+            root_invocation_id="INV-C",
+            trigger_mail_uid=origin_id,
+            require_structured_context=True,
         )
         self.assertFalse(self.query.find_terminal_reply(expected).found)
 

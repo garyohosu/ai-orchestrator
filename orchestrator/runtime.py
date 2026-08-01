@@ -10,9 +10,13 @@ from enum import Enum
 from pathlib import Path
 from typing import Any
 
-from mail_adapter import ExpectedReply, MailPort, MailReplyQuery, resolve_reply_to_uid
+from mail_adapter import ExpectedReply, MailPort, MailReplyQuery
 from timeutil import shift_ms
 from winproc import is_same_running_process
+
+
+class RuntimeStateError(RuntimeError):
+    """Raised when a persistent launch/terminal guard is unsafe to use."""
 
 
 def _atomic_write_json(path: Path, data: Any) -> None:
@@ -36,6 +40,45 @@ class RunningAgentState:
     invocation_id: str = ""
     origin_mail_max_id: int = 0
     decision_id: str = ""
+    parent_invocation_id: str | None = None
+    root_invocation_id: str = ""
+    trigger_mail_uid: int | None = None
+
+    def __post_init__(self) -> None:
+        positive_ints = {
+            "pid": self.pid,
+            "origin_mail_id": self.origin_mail_id,
+        }
+        for name, value in positive_ints.items():
+            if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+                raise RuntimeStateError(f"{name} must be a positive integer")
+        for name, value in {
+            "retry_count": self.retry_count,
+            "origin_mail_max_id": self.origin_mail_max_id,
+        }.items():
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                raise RuntimeStateError(f"{name} must be a non-negative integer")
+        for name in (
+            "process_start_time_iso", "agent_name", "agent_uid", "job_id",
+            "recorded_at_iso", "invocation_id", "decision_id",
+            "root_invocation_id",
+        ):
+            if not isinstance(getattr(self, name), str):
+                raise RuntimeStateError(f"{name} must be a string")
+        if not isinstance(self.launch_command, list) or not all(
+            isinstance(item, str) for item in self.launch_command
+        ):
+            raise RuntimeStateError("launch_command must be a list of strings")
+        if self.parent_invocation_id is not None and not isinstance(
+            self.parent_invocation_id, str
+        ):
+            raise RuntimeStateError("parent_invocation_id must be a string or null")
+        if self.trigger_mail_uid is not None and (
+            isinstance(self.trigger_mail_uid, bool)
+            or not isinstance(self.trigger_mail_uid, int)
+            or self.trigger_mail_uid <= 0
+        ):
+            raise RuntimeStateError("trigger_mail_uid must be a positive integer or null")
 
     def to_dict(self) -> dict:
         return {
@@ -51,23 +94,31 @@ class RunningAgentState:
             "invocation_id": self.invocation_id,
             "origin_mail_max_id": self.origin_mail_max_id,
             "decision_id": self.decision_id,
+            "parent_invocation_id": self.parent_invocation_id,
+            "root_invocation_id": self.root_invocation_id,
+            "trigger_mail_uid": self.trigger_mail_uid,
         }
 
     @classmethod
     def from_dict(cls, data: dict) -> "RunningAgentState":
+        if not isinstance(data, dict):
+            raise RuntimeStateError("running state must be a JSON object")
         return cls(
-            pid=int(data["pid"]),
+            pid=data["pid"],
             process_start_time_iso=data["process_start_time_iso"],
             agent_name=data["agent_name"],
             agent_uid=data["agent_uid"],
             job_id=data["job_id"],
-            origin_mail_id=int(data["origin_mail_id"]),
-            launch_command=list(data["launch_command"]),
+            origin_mail_id=data["origin_mail_id"],
+            launch_command=data["launch_command"],
             recorded_at_iso=data["recorded_at_iso"],
-            retry_count=int(data.get("retry_count", 0)),
-            invocation_id=str(data.get("invocation_id", "")),
-            origin_mail_max_id=int(data.get("origin_mail_max_id", 0)),
-            decision_id=str(data.get("decision_id", "")),
+            retry_count=data.get("retry_count", 0),
+            invocation_id=data.get("invocation_id", ""),
+            origin_mail_max_id=data.get("origin_mail_max_id", 0),
+            decision_id=data.get("decision_id", ""),
+            parent_invocation_id=data.get("parent_invocation_id"),
+            root_invocation_id=data.get("root_invocation_id", ""),
+            trigger_mail_uid=data.get("trigger_mail_uid"),
         )
 
 
@@ -97,8 +148,10 @@ class RuntimeStateStore:
             try:
                 data = json.loads(path.read_text(encoding="utf-8"))
                 states.append(RunningAgentState.from_dict(data))
-            except (json.JSONDecodeError, KeyError, ValueError):
-                continue
+            except (json.JSONDecodeError, KeyError, TypeError, ValueError) as err:
+                raise RuntimeStateError(
+                    f"invalid running-state guard: {path.name}"
+                ) from err
         return states
 
     def remove(self, job_id: str) -> None:
@@ -128,14 +181,53 @@ class TerminalStateStore:
 
     def __init__(self, runtime_dir: Path) -> None:
         self._path = Path(runtime_dir) / "terminal_mail_ids.json"
+        self._delegation_path = Path(runtime_dir) / "delegated_invocations.json"
+
+    @staticmethod
+    def _validate_index(data: object, *, label: str) -> dict[str, str]:
+        if not isinstance(data, dict) or any(
+            not isinstance(key, str) or not isinstance(value, str)
+            for key, value in data.items()
+        ):
+            raise RuntimeStateError(f"invalid {label} index")
+        return data
 
     def _load(self) -> dict[str, str]:
         if not self._path.is_file():
             return {}
         try:
-            return json.loads(self._path.read_text(encoding="utf-8"))
-        except json.JSONDecodeError:
+            data = json.loads(self._path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError as err:
+            raise RuntimeStateError("invalid terminal mail index") from err
+        validated = self._validate_index(data, label="terminal mail")
+        if any(not key.isdigit() or int(key) <= 0 for key in validated):
+            raise RuntimeStateError("invalid terminal mail index key")
+        return validated
+
+    def _load_delegations(self) -> dict[str, str]:
+        if not self._delegation_path.is_file():
             return {}
+        try:
+            data = json.loads(self._delegation_path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError as err:
+            raise RuntimeStateError("invalid delegated invocation index") from err
+        validated = self._validate_index(data, label="delegated invocation")
+        if any(not value.isdigit() or int(value) <= 0 for value in validated.values()):
+            raise RuntimeStateError("invalid delegated invocation mail ID")
+        return validated
+
+    def claim_delegation(self, delegation_key: str, mail_id: int) -> bool:
+        if not isinstance(delegation_key, str) or not delegation_key:
+            raise RuntimeStateError("delegation key must be non-empty")
+        if isinstance(mail_id, bool) or not isinstance(mail_id, int) or mail_id <= 0:
+            raise RuntimeStateError("delegation mail ID must be positive")
+        data = self._load_delegations()
+        existing = data.get(delegation_key)
+        if existing is not None:
+            return int(existing) == mail_id
+        data[delegation_key] = str(mail_id)
+        _atomic_write_json(self._delegation_path, data)
+        return True
 
     def mark(self, origin_mail_id: int, status: str) -> None:
         data = self._load()
@@ -200,7 +292,8 @@ class StopController:
 class RecoveryActionKind(Enum):
     REQUEUE = "REQUEUE"
     NOTIFY_ORIGIN_SENDER = "NOTIFY_ORIGIN_SENDER"
-    MARK_COMPLETED = "MARK_COMPLETED"
+    MARK_RESULT = "MARK_RESULT"
+    MARK_COMPLETED = "MARK_COMPLETED"  # legacy compatibility
 
 
 @dataclass(frozen=True)
@@ -210,6 +303,9 @@ class RecoveryAction:
     origin_mail: dict | None = None
     reply_to_uid: str | None = None
     reply_mail_id: int | None = None
+    invocation_result: str | None = None
+    result_mail_uid: int | None = None
+    duplicate_mail_uids: tuple[int, ...] = ()
 
 
 class StaleRecoveryService:
@@ -239,11 +335,10 @@ class StaleRecoveryService:
         if origin is None or not origin["is_read"]:
             return RecoveryAction(kind=RecoveryActionKind.REQUEUE, state=state, origin_mail=origin)
 
-        reply_to_uid = resolve_reply_to_uid(self._mail, origin)
         expected = ExpectedReply(
             job_id=state.job_id,
             sender_uid=state.agent_uid,
-            recipient_uid=reply_to_uid,
+            recipient_uid="",
             origin_mail_id=state.origin_mail_id,
             # Shift 1ms earlier for the same reason DispatchCycle does
             # (mail_adapter/dispatch.py): find_mails' "sent_at > sent_after"
@@ -253,19 +348,34 @@ class StaleRecoveryService:
             invocation_id=state.invocation_id,
             max_mail_id=state.origin_mail_max_id or state.origin_mail_id,
             decision_id=state.decision_id,
+            parent_invocation_id=state.parent_invocation_id,
+            root_invocation_id=state.root_invocation_id,
+            trigger_mail_uid=state.trigger_mail_uid,
+            require_structured_context=bool(
+                state.invocation_id
+                and state.root_invocation_id
+                and state.trigger_mail_uid is not None
+            ),
         )
         reply = self._query.find_terminal_reply(expected)
         if reply.found:
             return RecoveryAction(
-                kind=RecoveryActionKind.MARK_COMPLETED,
+                kind=RecoveryActionKind.MARK_RESULT,
                 state=state,
                 origin_mail=origin,
-                reply_to_uid=reply_to_uid,
+                reply_to_uid=origin["sender_uid"],
                 reply_mail_id=reply.reply_mail_id,
+                invocation_result=(
+                    reply.invocation_result.value
+                    if reply.invocation_result is not None
+                    else None
+                ),
+                result_mail_uid=reply.result_mail_uid,
+                duplicate_mail_uids=reply.duplicate_mail_uids,
             )
         return RecoveryAction(
             kind=RecoveryActionKind.NOTIFY_ORIGIN_SENDER,
             state=state,
             origin_mail=origin,
-            reply_to_uid=reply_to_uid,
+            reply_to_uid=origin["sender_uid"],
         )

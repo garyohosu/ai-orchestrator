@@ -39,6 +39,13 @@ class LogEntry:
     handoff_count: int = 0
     visited_agents: list[str] = field(default_factory=list)
     handoff_reason: str | None = None
+    invocation_id: str | None = None
+    parent_invocation_id: str | None = None
+    root_invocation_id: str | None = None
+    trigger_mail_uid: int | None = None
+    result_mail_uid: int | None = None
+    invocation_result: str | None = None
+    duplicate_mail_uids: tuple[int, ...] = ()
     timestamp: str = field(default_factory=now_iso)
 
 
@@ -84,6 +91,13 @@ class JobLogger:
             "handoff_count": entry.handoff_count,
             "visited_agents": entry.visited_agents,
             "handoff_reason": _scrub(entry.handoff_reason),
+            "invocation_id": entry.invocation_id,
+            "parent_invocation_id": entry.parent_invocation_id,
+            "root_invocation_id": entry.root_invocation_id,
+            "trigger_mail_uid": entry.trigger_mail_uid,
+            "result_mail_uid": entry.result_mail_uid,
+            "invocation_result": entry.invocation_result,
+            "duplicate_mail_uids": list(entry.duplicate_mail_uids),
         }
         with self._log_path.open("a", encoding="utf-8") as fh:
             fh.write(json.dumps(record, ensure_ascii=False) + "\n")

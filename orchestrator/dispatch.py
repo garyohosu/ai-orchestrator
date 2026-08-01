@@ -4,14 +4,27 @@ from __future__ import annotations
 
 import re
 import json
-from dataclasses import dataclass, field
+import hashlib
+from dataclasses import dataclass, field, replace
 from enum import Enum
 from pathlib import Path
 from typing import Callable
 
 from config import AgentDefinition
-from invocation import generate_invocation_id
-from launcher import CliLauncher, CliNotFoundError, ProcessResult, redact_command
+from invocation import (
+    InvocationIdError,
+    InvocationMetadataError,
+    InvocationResult,
+    derive_invocation_lineage,
+    generate_invocation_id,
+)
+from launcher import (
+    CliLauncher,
+    CliNotFoundError,
+    ProcessResult,
+    TerminalDetection,
+    redact_command,
+)
 from logging_utils import JobLogger, LogEntry
 from mail_adapter import (
     ExpectedReply,
@@ -441,10 +454,20 @@ class DispatchCycle:
 
         unread_mails = self._watcher.list_unread_mails(agent)
         pending_mails = [m for m in unread_mails if not self._terminal_store.is_terminal(m["mail_id"])]
-        if not pending_mails:
+        origin_mail = None
+        for candidate in pending_mails:
+            delegation_key = self._delegation_key(candidate)
+            if delegation_key is not None and not self._terminal_store.claim_delegation(
+                delegation_key, int(candidate["mail_id"])
+            ):
+                self._terminal_store.mark(
+                    int(candidate["mail_id"]), "DUPLICATE_DELEGATED_RESULT"
+                )
+                continue
+            origin_mail = candidate
+            break
+        if origin_mail is None:
             return None
-
-        origin_mail = pending_mails[0]
         job_id = extract_job_id(origin_mail["subject"], origin_mail["mail_id"], logger=self._logger)
         decision_match = _DECISION_ID_PATTERN.search(origin_mail.get("subject", ""))
         decision_id = decision_match.group(1) if decision_match else None
@@ -455,19 +478,89 @@ class DispatchCycle:
             )
             return AgentOutcome(agent, OutcomeStatus.HUMAN_REQUIRED, job_id, origin_mail["mail_id"])
 
-        status, process_result, retry_count = self._launch_with_retries(agent, job_id, origin_mail)
-
-        if process_result is not None and process_result.terminal_status is not None:
-            terminal_status = process_result.terminal_status
-            if status == OutcomeStatus.SUCCESS:
-                self._round_trips.increment(job_id)
-            self._terminal_store.mark(origin_mail["mail_id"], terminal_status)
+        try:
+            status, process_result, retry_count = self._launch_with_retries(
+                agent, job_id, origin_mail
+            )
+        except (InvocationMetadataError, InvocationIdError) as err:
+            reason = "起動メールの構造化Invocationメタデータが不正です"
+            detail = NotificationDetail(
+                target_agent_name=agent.name,
+                target_agent_uid=agent.uid,
+                failed_stage="起動メタデータ検証",
+                reason=reason,
+                exit_code=None,
+                duration_sec=None,
+                retry_count=0,
+                last_attempt_at=now_iso(),
+                origin_mail_status="処理対象外",
+                recommended_action="送信元で構造化メタデータを修正してください。",
+                decision_id=decision_id,
+            )
+            notified = self._notifier.notify(
+                job_id,
+                origin_mail["mail_id"],
+                origin_mail["sender_uid"],
+                OutcomeStatus.HUMAN_REQUIRED,
+                detail,
+            )
+            self._terminal_store.mark(
+                origin_mail["mail_id"], "INVALID_INVOCATION_METADATA"
+            )
             self._checkpoint_store.save(
                 Checkpoint(
                     job_id=job_id,
                     purpose=origin_mail["subject"],
-                    current_state=terminal_status,
-                    next_actions=["workerの応答を待機" if terminal_status == "WAITING_FOR_WORKER" else ("directorへ次の処理を委任" if terminal_status == "WAITING_FOR_DECISION" else "終端状態を保持")],
+                    current_state=OutcomeStatus.HUMAN_REQUIRED.value,
+                    open_issues=[reason],
+                    next_actions=["送信元によるメタデータ修正が必要です"],
+                )
+            )
+            self._logger.log_warning(
+                LogEntry(
+                    job_id=job_id,
+                    mail_id=origin_mail["mail_id"],
+                    agent_name=agent.name,
+                    command_summary=None,
+                    started_at=None,
+                    finished_at=now_iso(),
+                    exit_code=None,
+                    result="INVALID_INVOCATION_METADATA",
+                    error=type(err).__name__,
+                    next_recipient=(origin_mail["sender_uid"] if notified else None),
+                )
+            )
+            return AgentOutcome(
+                agent,
+                OutcomeStatus.HUMAN_REQUIRED,
+                job_id,
+                origin_mail["mail_id"],
+            )
+
+        if process_result is not None and process_result.terminal_status is not None:
+            terminal_status = process_result.terminal_status
+            terminal_result = process_result.invocation_result or terminal_status
+            if status == OutcomeStatus.SUCCESS:
+                self._round_trips.increment(job_id)
+            self._terminal_store.mark(origin_mail["mail_id"], terminal_result)
+            for duplicate_mail_uid in process_result.duplicate_mail_uids:
+                self._terminal_store.mark(
+                    duplicate_mail_uid, "DUPLICATE_INVOCATION_RESULT"
+                )
+            self._checkpoint_store.save(
+                Checkpoint(
+                    job_id=job_id,
+                    purpose=origin_mail["subject"],
+                    current_state=terminal_result,
+                    next_actions=[
+                        "委任先の応答を待機"
+                        if terminal_result == InvocationResult.DELEGATED.value
+                        else (
+                            "待機中の外部結果を待つ"
+                            if terminal_result == InvocationResult.WAITING.value
+                            else "終端状態を保持"
+                        )
+                    ],
                 )
             )
             self._logger.log_outcome(
@@ -483,6 +576,13 @@ class DispatchCycle:
                     stdout_artifact=self._artifact_dict(process_result, "stdout"),
                     stderr_artifact=self._artifact_dict(process_result, "stderr"),
                     classification=self._classification_dict(process_result),
+                    invocation_id=process_result.invocation_id,
+                    parent_invocation_id=process_result.parent_invocation_id,
+                    root_invocation_id=process_result.root_invocation_id,
+                    trigger_mail_uid=process_result.trigger_mail_uid,
+                    result_mail_uid=process_result.result_mail_uid,
+                    invocation_result=process_result.invocation_result,
+                    duplicate_mail_uids=process_result.duplicate_mail_uids,
                 )
             )
             return AgentOutcome(agent, status, job_id, origin_mail["mail_id"])
@@ -512,6 +612,13 @@ class DispatchCycle:
                     stdout_artifact=self._artifact_dict(process_result, "stdout"),
                     stderr_artifact=self._artifact_dict(process_result, "stderr"),
                     classification=self._classification_dict(process_result),
+                    invocation_id=(process_result.invocation_id if process_result else None),
+                    parent_invocation_id=(process_result.parent_invocation_id if process_result else None),
+                    root_invocation_id=(process_result.root_invocation_id if process_result else None),
+                    trigger_mail_uid=(process_result.trigger_mail_uid if process_result else None),
+                    result_mail_uid=(process_result.result_mail_uid if process_result else None),
+                    invocation_result=(process_result.invocation_result if process_result else None),
+                    duplicate_mail_uids=(process_result.duplicate_mail_uids if process_result else ()),
                 )
             )
             return AgentOutcome(agent, status, job_id, origin_mail["mail_id"])
@@ -575,9 +682,49 @@ class DispatchCycle:
                 stdout_artifact=detail.stdout_artifact,
                 stderr_artifact=detail.stderr_artifact,
                 classification=detail.classification,
+                invocation_id=(process_result.invocation_id if process_result else None),
+                parent_invocation_id=(process_result.parent_invocation_id if process_result else None),
+                root_invocation_id=(process_result.root_invocation_id if process_result else None),
+                trigger_mail_uid=(process_result.trigger_mail_uid if process_result else None),
+                result_mail_uid=(process_result.result_mail_uid if process_result else None),
+                invocation_result=(process_result.invocation_result if process_result else None),
+                duplicate_mail_uids=(process_result.duplicate_mail_uids if process_result else ()),
             )
         )
         return AgentOutcome(agent, final_status, job_id, origin_mail["mail_id"])
+
+    @staticmethod
+    def _delegation_key(message: dict) -> str | None:
+        """Return a stable key for a DELEGATED result that is also a task."""
+
+        try:
+            payload = json.loads(message.get("body", ""))
+        except (TypeError, json.JSONDecodeError):
+            return None
+        if not isinstance(payload, dict):
+            return None
+        if not (
+            payload.get("message_type") == "DECISION_REQUEST"
+            and payload.get("task_eligible") is True
+            and payload.get("invocation_result") == InvocationResult.DELEGATED.value
+        ):
+            return None
+        fields = {
+            "sender_uid": message.get("sender_uid"),
+            "job_id": payload.get("job_id"),
+            "decision_id": payload.get("decision_id"),
+            "invocation_id": payload.get("invocation_id"),
+            "parent_invocation_id": payload.get("parent_invocation_id"),
+            "root_invocation_id": payload.get("root_invocation_id"),
+            "trigger_mail_uid": payload.get("trigger_mail_uid"),
+        }
+        if any(
+            value is None and key != "parent_invocation_id"
+            for key, value in fields.items()
+        ):
+            return None
+        canonical = json.dumps(fields, sort_keys=True, separators=(",", ":"))
+        return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
     @staticmethod
     def _artifact_dict(result: ProcessResult | None, stream: str) -> dict[str, object] | None:
@@ -752,6 +899,7 @@ class DispatchCycle:
         if dec_match:
             decision_id = dec_match.group(1)
         invocation_id = generate_invocation_id(attempt)
+        lineage = derive_invocation_lineage(origin_mail, invocation_id)
         origin_mail_max_id = max(
             (int(mail.get("mail_id", 0)) for mail in self._mail.find_mails(limit=None)), default=0
         )
@@ -763,25 +911,20 @@ class DispatchCycle:
             "DECISION_ID": decision_id,
             "INVOCATION_ID": invocation_id,
             "AI_INVOCATION_ID": invocation_id,
+            "AI_ROOT_INVOCATION_ID": lineage.root_invocation_id,
+            "AI_TRIGGER_MAIL_UID": str(lineage.trigger_mail_uid),
             "PROJECT_PATH": str(self._project_path),
         }
+        if lineage.parent_invocation_id is not None:
+            env_vars["AI_PARENT_INVOCATION_ID"] = lineage.parent_invocation_id
         if hasattr(self._mail, "_db_path") and getattr(self._mail, "_db_path"):
             env_vars["AGENT_MAIL_DB_PATH"] = str(getattr(self._mail, "_db_path"))
 
         try:
-            try:
-                launched = self._launcher.launch(
-                    agent, job_id, origin_mail["mail_id"], self._project_path,
-                    attempt=attempt, env_vars=env_vars, invocation_id=invocation_id
-                )
-            except TypeError as err:
-                # Preserve compatibility with test/dedicated launchers that
-                # implement the pre-output-capture four-argument contract.
-                if "attempt" not in str(err) and "env_vars" not in str(err):
-                    raise
-                launched = self._launcher.launch(
-                    agent, job_id, origin_mail["mail_id"], self._project_path
-                )
+            launched = self._launcher.launch(
+                agent, job_id, origin_mail["mail_id"], self._project_path,
+                attempt=attempt, env_vars=env_vars, invocation_id=invocation_id
+            )
         except CliNotFoundError:
             return OutcomeStatus.DELIVERY_FAILED, None
 
@@ -799,6 +942,9 @@ class DispatchCycle:
             invocation_id=invocation_id,
             origin_mail_max_id=origin_mail_max_id,
             decision_id=decision_id,
+            parent_invocation_id=lineage.parent_invocation_id,
+            root_invocation_id=lineage.root_invocation_id,
+            trigger_mail_uid=lineage.trigger_mail_uid,
             launch_command=redacted_command,
             recorded_at_iso=launched.launched_at_iso,
             retry_count=attempt - 1,
@@ -814,12 +960,25 @@ class DispatchCycle:
                 finished_at=None,
                 exit_code=None,
                 result="LAUNCHED",
+                invocation_id=invocation_id,
+                parent_invocation_id=lineage.parent_invocation_id,
+                root_invocation_id=lineage.root_invocation_id,
+                trigger_mail_uid=lineage.trigger_mail_uid,
             )
         )
         try:
             process_result = launched.wait(
                 self._cli_timeout_sec,
-                terminal_reply_check=self._terminal_reply_checker(agent, origin_mail, job_id, invocation_id, origin_mail_max_id),
+                terminal_reply_check=self._terminal_reply_checker(
+                    agent,
+                    origin_mail,
+                    job_id,
+                    invocation_id,
+                    origin_mail_max_id,
+                    lineage.parent_invocation_id,
+                    lineage.root_invocation_id,
+                    lineage.trigger_mail_uid,
+                ),
                 poll_interval_sec=self._terminal_poll_interval_sec,
                 terminal_grace_sec=self._terminal_grace_sec,
             )
@@ -883,54 +1042,159 @@ class DispatchCycle:
             # while a possibly-still-alive process lingers (SPEC.md 24章).
             # STALE recovery will re-verify and clean it up on next startup.
 
-        reply_found = False
-        if not process_result.timed_out and process_result.exit_code == 0:
-            reply_to_uid = resolve_reply_to_uid(self._mail, origin_mail)
-            # Shift 1ms earlier than the recorded launch instant so a reply
-            # landing in the same millisecond is not spuriously excluded by
-            # find_mails' strict "sent_at > sent_after" comparison.
-            not_before = shift_ms(launched.launched_at_iso, -1)
-            expected = ExpectedReply(
-                job_id=job_id,
-                sender_uid=agent.uid,
-                recipient_uid=reply_to_uid,
-                origin_mail_id=origin_mail["mail_id"],
-                not_before_iso=not_before,
-                invocation_id=invocation_id,
-                max_mail_id=origin_mail_max_id,
-                decision_id=decision_id,
-            )
-            reply_result = self._reply_verifier.wait_for_terminal_reply(
-                expected, self._reply_check_timeout_sec
-            )
-            reply_found = reply_result.found
+        process_result = replace(
+            process_result,
+            parent_invocation_id=(
+                process_result.parent_invocation_id
+                if process_result.parent_invocation_id is not None
+                else lineage.parent_invocation_id
+            ),
+            root_invocation_id=(
+                process_result.root_invocation_id or lineage.root_invocation_id
+            ),
+            trigger_mail_uid=(
+                process_result.trigger_mail_uid or lineage.trigger_mail_uid
+            ),
+        )
 
+        # MailReplyQuery correlates terminal results by structured
+        # Invocation-ID and lineage, never by a guessed recipient.
+        expected = ExpectedReply(
+            job_id=job_id,
+            sender_uid=agent.uid,
+            recipient_uid="",
+            origin_mail_id=origin_mail["mail_id"],
+            not_before_iso=shift_ms(launched.launched_at_iso, -1),
+            invocation_id=invocation_id,
+            max_mail_id=origin_mail_max_id,
+            decision_id=decision_id,
+            parent_invocation_id=lineage.parent_invocation_id,
+            root_invocation_id=lineage.root_invocation_id,
+            trigger_mail_uid=lineage.trigger_mail_uid,
+            require_structured_context=True,
+        )
+        reply_result = None
+        if process_result.terminal_mail_id is None:
+            if not process_result.timed_out and process_result.exit_code == 0:
+                reply_result = self._reply_verifier.wait_for_terminal_reply(
+                    expected, self._reply_check_timeout_sec
+                )
+            else:
+                # Poll through a bounded post-termination grace. A valid result
+                # committed at the timeout edge wins; later mail cannot reopen
+                # the terminal origin-mail record.
+                reply_result = self._reply_verifier.wait_for_terminal_reply(
+                    expected,
+                    min(self._terminal_grace_sec, self._reply_check_timeout_sec),
+                )
+        else:
+            # Re-read once after process completion. The callback may have
+            # observed the first valid result before a duplicate committed;
+            # this final read preserves the lowest mail ID as canonical and
+            # records every duplicate already visible without reopening state.
+            reply_result = self._reply_query.find_terminal_reply(expected)
+        if reply_result is not None and reply_result.found:
+            duplicate_mail_uids = tuple(
+                sorted(
+                    set(process_result.duplicate_mail_uids).union(
+                        reply_result.duplicate_mail_uids
+                    )
+                )
+            )
+            process_result = replace(
+                process_result,
+                terminal_status=reply_result.status,
+                terminal_mail_id=reply_result.reply_mail_id,
+                invocation_result=(
+                    reply_result.invocation_result.value
+                    if reply_result.invocation_result is not None
+                    else None
+                ),
+                parent_invocation_id=reply_result.parent_invocation_id,
+                root_invocation_id=reply_result.root_invocation_id,
+                trigger_mail_uid=reply_result.trigger_mail_uid,
+                result_mail_uid=reply_result.result_mail_uid,
+                duplicate_mail_uids=duplicate_mail_uids,
+            )
+
+        reply_found = process_result.terminal_mail_id is not None
+        invocation_result = process_result.invocation_result
         terminal_status = process_result.terminal_status
-        if terminal_status in {"WAITING_FOR_DECISION", "WAITING_FOR_WORKER", "COMPLETED"}:
+        if invocation_result in {
+            InvocationResult.COMPLETED.value,
+            InvocationResult.DELEGATED.value,
+            InvocationResult.WAITING.value,
+        }:
+            status = OutcomeStatus.SUCCESS
+            reply_found = True
+        elif invocation_result == InvocationResult.FAILED.value:
+            status = OutcomeStatus.FAILED
+        elif terminal_status in {
+            "WAITING_FOR_DECISION",
+            "WAITING_FOR_WORKER",
+            "COMPLETED",
+            "DELEGATED",
+        }:
             status = OutcomeStatus.SUCCESS
             reply_found = True
         elif terminal_status == "HUMAN_REQUIRED":
             status = OutcomeStatus.HUMAN_REQUIRED
-        elif terminal_status in {"FAILED", "REJECTED", "CANCELLED"}:
+        elif terminal_status in {
+            "FAILED",
+            "REJECTED",
+            "CANCELLED",
+            "CONFLICTING_RESULTS",
+        }:
             status = OutcomeStatus.FAILED
         else:
             status = self._classifier.classify(
-                cli_launch_failed=False, process_result=process_result, reply_found=reply_found
+                cli_launch_failed=False,
+                process_result=process_result,
+                reply_found=reply_found,
             )
         return status, process_result
 
-    def _terminal_reply_checker(self, agent: AgentDefinition, origin_mail: dict, job_id: str, invocation_id: str, origin_mail_max_id: int):
-        reply_to_uid = resolve_reply_to_uid(self._mail, origin_mail)
+    def _terminal_reply_checker(
+        self,
+        agent: AgentDefinition,
+        origin_mail: dict,
+        job_id: str,
+        invocation_id: str,
+        origin_mail_max_id: int,
+        parent_invocation_id: str | None,
+        root_invocation_id: str,
+        trigger_mail_uid: int,
+    ):
         not_before = shift_ms(origin_mail.get("sent_at", now_iso()), -1)
 
         def check():
             result = self._reply_query.find_terminal_reply(ExpectedReply(
-                job_id=job_id, sender_uid=agent.uid, recipient_uid=reply_to_uid,
+                job_id=job_id, sender_uid=agent.uid, recipient_uid="",
                 origin_mail_id=origin_mail["mail_id"], not_before_iso=not_before,
                 invocation_id=invocation_id, max_mail_id=origin_mail_max_id,
                 decision_id=_DECISION_ID_PATTERN.search(origin_mail.get("subject", "")).group(1) if _DECISION_ID_PATTERN.search(origin_mail.get("subject", "")) else "",
+                parent_invocation_id=parent_invocation_id,
+                root_invocation_id=root_invocation_id,
+                trigger_mail_uid=trigger_mail_uid,
+                require_structured_context=True,
             ))
-            return (result.status, result.reply_mail_id) if result.found else None
+            if not result.found:
+                return None
+            assert result.status is not None
+            assert result.result_mail_uid is not None
+            return TerminalDetection(
+                status=result.status,
+                result_mail_uid=result.result_mail_uid,
+                invocation_result=(
+                    result.invocation_result.value
+                    if result.invocation_result is not None
+                    else None
+                ),
+                parent_invocation_id=result.parent_invocation_id,
+                root_invocation_id=result.root_invocation_id,
+                trigger_mail_uid=result.trigger_mail_uid,
+                duplicate_mail_uids=result.duplicate_mail_uids,
+            )
         return check
 
     def _finalize_without_notify(
