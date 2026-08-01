@@ -13,6 +13,7 @@ only ever used when a test explicitly injects it.
 from __future__ import annotations
 
 import importlib.util
+import json
 import re
 import sys
 import types
@@ -176,8 +177,34 @@ class MailReplyQuery:
         return ReplyCheckResult(found=False)
 
     @staticmethod
-    def _invocation_matches(message: dict, invocation_id: str) -> bool:
-        return not invocation_id or invocation_id in (message.get("subject", "") + "\n" + message.get("body", ""))
+    def _structured_payload(message: dict) -> dict | None:
+        try:
+            payload = json.loads(message.get("body", ""))
+        except (TypeError, json.JSONDecodeError):
+            return None
+        return payload if isinstance(payload, dict) else None
+
+    @classmethod
+    def _invocation_matches(cls, message: dict, invocation_id: str) -> bool:
+        payload = cls._structured_payload(message)
+        if payload is None:
+            return False
+        body_inv = payload.get("invocation_id")
+        if not invocation_id:
+            return False
+        if not isinstance(body_inv, str) or not body_inv or body_inv != invocation_id:
+            return False
+
+        subject_inv = None
+        subject = message.get("subject", "")
+        subj_match = re.search(
+            r"\[((?:INV|MANUAL)-[A-Za-z0-9._-]+)\]", subject
+        )
+        if subj_match:
+            subject_inv = subj_match.group(1)
+        if subject_inv and body_inv and subject_inv != body_inv:
+            return False
+        return True
 
     def find_terminal_reply(self, expected: ExpectedReply) -> ReplyCheckResult:
         matches = self._mail.find_mails(
@@ -188,24 +215,40 @@ class MailReplyQuery:
             sent_after=expected.not_before_iso,
             limit=None,
         )
-        terminal = {"WAITING_FOR_DECISION", "WAITING_FOR_WORKER", "COMPLETED", "FAILED", "HUMAN_REQUIRED", "REJECTED", "CANCELLED"}
-        import json
+        terminal = {
+            "WAITING_FOR_DECISION",
+            "WAITING_FOR_WORKER",
+            "COMPLETED",
+            "FAILED",
+            "HUMAN_REQUIRED",
+            "REJECTED",
+            "CANCELLED",
+        }
         for message in matches:
             if not self._invocation_matches(message, expected.invocation_id):
                 continue
-            if expected.decision_id and expected.decision_id not in (message.get("subject", "") + "\n" + message.get("body", "")):
+            payload = self._structured_payload(message)
+            assert payload is not None
+            if expected.decision_id:
+                body_decision_id = payload.get("decision_id")
+                if body_decision_id is not None:
+                    if (
+                        not isinstance(body_decision_id, str)
+                        or body_decision_id != expected.decision_id
+                    ):
+                        continue
+                else:
+                    subject_decision_ids = set(
+                        re.findall(
+                            r"\[(DEC-[A-Za-z0-9._-]+)\]",
+                            message.get("subject", ""),
+                        )
+                    )
+                    if expected.decision_id not in subject_decision_ids:
+                        continue
+            status = payload.get("status")
+            if not isinstance(status, str):
                 continue
-            status = None
-            try:
-                payload = json.loads(message.get("body", ""))
-                if isinstance(payload, dict):
-                    status = payload.get("status")
-            except (TypeError, ValueError):
-                pass
-            if status not in terminal:
-                subject = message.get("subject", "")
-                body = message.get("body", "")
-                status = next((candidate for candidate in terminal if candidate in subject or f"status: {candidate}" in body), None)
             if status in terminal:
                 return ReplyCheckResult(True, int(message["mail_id"]), status)
         return ReplyCheckResult(False)

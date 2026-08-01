@@ -157,7 +157,8 @@ CLIが見つからない・起動できない・異常終了した・タイム�
 ### 単体テスト（`mail`パッケージ不要）
 
 ```powershell
-py -3 -m unittest discover -s orchestrator\tests
+Set-Location .\orchestrator
+py -3 -m unittest discover -s tests -p "test_*.py"
 ```
 
 すべてインメモリのテストダブル（`tests/fakes.py`の`InMemoryMailAdapter`）を明示的に注入して実行されるため、実物の`mail`パッケージは不要です。`pytest`などの外部パッケージにも依存しません。

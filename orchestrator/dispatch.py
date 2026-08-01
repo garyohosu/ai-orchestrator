@@ -4,13 +4,13 @@ from __future__ import annotations
 
 import re
 import json
-import uuid
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
 from typing import Callable
 
 from config import AgentDefinition
+from invocation import generate_invocation_id
 from launcher import CliLauncher, CliNotFoundError, ProcessResult, redact_command
 from logging_utils import JobLogger, LogEntry
 from mail_adapter import (
@@ -751,7 +751,7 @@ class DispatchCycle:
         dec_match = re.search(r"\[(DEC-[A-Za-z0-9._-]+)\]", subj)
         if dec_match:
             decision_id = dec_match.group(1)
-        invocation_id = f"INV-{now_iso().replace('-', '').replace(':', '').replace('.', '')}-{attempt:03d}-{uuid.uuid4().hex[:8].upper()}"
+        invocation_id = generate_invocation_id(attempt)
         origin_mail_max_id = max(
             (int(mail.get("mail_id", 0)) for mail in self._mail.find_mails(limit=None)), default=0
         )
@@ -762,6 +762,7 @@ class DispatchCycle:
             "JOB_ID": job_id,
             "DECISION_ID": decision_id,
             "INVOCATION_ID": invocation_id,
+            "AI_INVOCATION_ID": invocation_id,
             "PROJECT_PATH": str(self._project_path),
         }
         if hasattr(self._mail, "_db_path") and getattr(self._mail, "_db_path"):

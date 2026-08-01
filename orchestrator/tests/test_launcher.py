@@ -1,10 +1,17 @@
+import json
 import sys
 import tempfile
 import unittest
+import uuid
 from pathlib import Path
 
 import launcher as launcher_module
 from config import AgentDefinition
+from invocation import (
+    InvocationIdError,
+    generate_invocation_id,
+    resolve_launch_invocation_id,
+)
 from launcher import CliLauncher, CliNotFoundError, CliPathResolver, redact_command
 from tests.fakes import FakeCliAdapter
 
@@ -178,6 +185,97 @@ class CliLauncherTests(unittest.TestCase):
             launched.wait(timeout_sec=10)
         finally:
             launcher_module.get_process_start_time_iso = original
+
+    def test_launcher_passes_invocation_ids_in_env(self) -> None:
+        out_path = self.project_path / "env_dump.json"
+        agent_script = self.project_path / "dump_env.py"
+        agent_script.write_text(f"""from __future__ import annotations
+import json
+import os
+import sys
+
+data = {{
+    "AI_INVOCATION_ID": os.environ.get("AI_INVOCATION_ID"),
+    "INVOCATION_ID": os.environ.get("INVOCATION_ID")
+}}
+with open(r"{out_path}", "w", encoding="utf-8") as f:
+    json.dump(data, f)
+""", encoding="utf-8")
+
+        agent = AgentDefinition(
+            name="worker",
+            uid="UID000002",
+            cli_type="fake",
+            command=[sys.executable, str(agent_script)],
+        )
+
+        launcher = self._launcher_for("dump_env.py")
+
+        launched1 = launcher.launch(
+            agent,
+            "JOB-1",
+            1,
+            self.project_path,
+            invocation_id="INV-TEST-FIRST",
+        )
+        launched1.wait(timeout_sec=10)
+
+        captured1 = json.loads(out_path.read_text(encoding="utf-8"))
+        self.assertEqual(captured1["AI_INVOCATION_ID"], "INV-TEST-FIRST")
+        self.assertEqual(captured1["INVOCATION_ID"], "INV-TEST-FIRST")
+
+        launched2 = launcher.launch(
+            agent,
+            "JOB-1",
+            2,
+            self.project_path,
+            invocation_id="INV-TEST-SECOND",
+        )
+        launched2.wait(timeout_sec=10)
+
+        captured2 = json.loads(out_path.read_text(encoding="utf-8"))
+        self.assertEqual(captured2["AI_INVOCATION_ID"], "INV-TEST-SECOND")
+        self.assertEqual(captured2["INVOCATION_ID"], "INV-TEST-SECOND")
+        self.assertNotEqual(captured1["AI_INVOCATION_ID"], captured2["AI_INVOCATION_ID"])
+
+    def test_invocation_id_generator_uses_complete_uuid4(self) -> None:
+        generated_ids = {generate_invocation_id() for _ in range(1000)}
+        self.assertEqual(len(generated_ids), 1000)
+        for invocation_id in generated_ids:
+            parsed = uuid.UUID(invocation_id[-36:])
+            self.assertEqual(parsed.version, 4)
+            self.assertEqual(str(parsed).upper(), invocation_id[-36:])
+
+    def test_launcher_rejects_conflicting_invocation_ids(self) -> None:
+        with self.assertRaises(InvocationIdError):
+            self._launcher_for("exit_success.py").launch(
+                self._agent("exit_success.py"),
+                "JOB-1",
+                1,
+                self.project_path,
+                env_vars={"AI_INVOCATION_ID": "INV-OTHER"},
+                invocation_id="INV-TRACKED",
+            )
+
+    def test_launch_boundary_rejects_non_string_invocation_id(self) -> None:
+        for invalid in (123, True, ["INV-X"]):
+            with self.subTest(invalid=invalid):
+                with self.assertRaises(InvocationIdError):
+                    resolve_launch_invocation_id(invalid, None, attempt=1)
+
+    def test_instruction_template_includes_invocation_id(self) -> None:
+        out_path = self.project_path / "captured_inst.txt"
+        agent = AgentDefinition(
+            name="worker",
+            uid="UID000002",
+            cli_type="fake",
+            command=[sys.executable, str(_STUBS_DIR / "echo_instruction.py"), str(out_path)],
+        )
+        launcher = self._launcher_for("echo_instruction.py")
+        launched = launcher.launch(agent, "JOB-1", 1, self.project_path, invocation_id="INV-METADATA-123")
+        launched.wait(timeout_sec=10)
+        captured = out_path.read_text(encoding="utf-8")
+        self.assertIn("Invocation-IDはINV-METADATA-123です。", captured)
 
 
 class RedactCommandTests(unittest.TestCase):

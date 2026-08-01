@@ -195,6 +195,98 @@ class MailReplyQueryTests(unittest.TestCase):
         self.assertTrue(result.found)
         self.assertEqual(result.status, "WAITING_FOR_WORKER")
 
+    def test_terminal_reply_requires_body_metadata_match(self) -> None:
+        origin_id = self.mail.send_mail(self.commander, self.worker, "[JOB-A] [DEC-1] request", "b")
+        # 1. Subject matches but body has mismatched invocation_id (Should be ignored)
+        self.mail.send_mail(self.worker, self.commander, "[JOB-A] [DEC-1] [INV-MATCH] STATUS: COMPLETED", '{"status":"COMPLETED","invocation_id":"INV-MISMATCH"}')
+        expected = ExpectedReply(
+            job_id="JOB-A", sender_uid=self.worker, recipient_uid=self.commander,
+            origin_mail_id=origin_id, not_before_iso=shift_ms(now_iso(), -60_000),
+            invocation_id="INV-MATCH", max_mail_id=origin_id, decision_id="DEC-1",
+        )
+        self.assertFalse(self.query.find_terminal_reply(expected).found)
+
+        # 2. Correct invocation_id in body
+        self.mail.send_mail(self.worker, self.commander, "[JOB-A] [DEC-1] [INV-MATCH] STATUS: COMPLETED", '{"status":"COMPLETED","invocation_id":"INV-MATCH"}')
+        self.assertTrue(self.query.find_terminal_reply(expected).found)
+
+    def test_terminal_reply_rejects_subject_body_mismatch(self) -> None:
+        origin_id = self.mail.send_mail(self.commander, self.worker, "[JOB-A] [DEC-1] request", "b")
+        # Subject specifies INV-A, but body JSON specifies INV-B (Should be ignored as a mismatch)
+        self.mail.send_mail(self.worker, self.commander, "[JOB-A] [DEC-1] [INV-A] STATUS: COMPLETED", '{"status":"COMPLETED","invocation_id":"INV-B"}')
+        expected = ExpectedReply(
+            job_id="JOB-A", sender_uid=self.worker, recipient_uid=self.commander,
+            origin_mail_id=origin_id, not_before_iso=shift_ms(now_iso(), -60_000),
+            invocation_id="INV-A", max_mail_id=origin_id, decision_id="DEC-1",
+        )
+        self.assertFalse(self.query.find_terminal_reply(expected).found)
+
+    def test_terminal_reply_uses_structured_status_as_truth(self) -> None:
+        origin_id = self.mail.send_mail(
+            self.commander, self.worker, "[JOB-A] [DEC-1] request", "b"
+        )
+        expected = ExpectedReply(
+            job_id="JOB-A",
+            sender_uid=self.worker,
+            recipient_uid=self.commander,
+            origin_mail_id=origin_id,
+            not_before_iso=shift_ms(now_iso(), -60_000),
+            invocation_id="INV-STRICT",
+            max_mail_id=origin_id,
+            decision_id="DEC-1",
+        )
+        self.mail.send_mail(
+            self.worker,
+            self.commander,
+            "[JOB-A] [DEC-1] [INV-STRICT] STATUS: COMPLETED",
+            '{"status":"ACK_RECEIVED","invocation_id":"INV-STRICT"}',
+        )
+        self.assertFalse(self.query.find_terminal_reply(expected).found)
+
+    def test_terminal_reply_rejects_non_string_structured_status(self) -> None:
+        origin_id = self.mail.send_mail(
+            self.commander, self.worker, "[JOB-A] [DEC-1] request", "b"
+        )
+        self.mail.send_mail(
+            self.worker,
+            self.commander,
+            "[JOB-A] [DEC-1] [INV-STRICT] STATUS: COMPLETED",
+            '{"status":[],"invocation_id":"INV-STRICT"}',
+        )
+        expected = ExpectedReply(
+            job_id="JOB-A",
+            sender_uid=self.worker,
+            recipient_uid=self.commander,
+            origin_mail_id=origin_id,
+            not_before_iso=shift_ms(now_iso(), -60_000),
+            invocation_id="INV-STRICT",
+            max_mail_id=origin_id,
+            decision_id="DEC-1",
+        )
+        self.assertFalse(self.query.find_terminal_reply(expected).found)
+
+    def test_terminal_reply_requires_expected_and_body_invocation_ids(self) -> None:
+        origin_id = self.mail.send_mail(
+            self.commander, self.worker, "[JOB-A] [DEC-1] request", "b"
+        )
+        self.mail.send_mail(
+            self.worker,
+            self.commander,
+            "[JOB-A] [DEC-1] STATUS: COMPLETED",
+            '{"status":"COMPLETED"}',
+        )
+        expected = ExpectedReply(
+            job_id="JOB-A",
+            sender_uid=self.worker,
+            recipient_uid=self.commander,
+            origin_mail_id=origin_id,
+            not_before_iso=shift_ms(now_iso(), -60_000),
+            invocation_id="",
+            max_mail_id=origin_id,
+            decision_id="DEC-1",
+        )
+        self.assertFalse(self.query.find_terminal_reply(expected).found)
+
 
 class ReplyVerifierTests(unittest.TestCase):
     def test_returns_immediately_when_reply_already_present(self) -> None:

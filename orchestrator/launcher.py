@@ -14,6 +14,7 @@ from pathlib import Path
 
 from adapters.base import CliAdapter, CliEvidence
 from config import AgentDefinition
+from invocation import resolve_launch_invocation_id
 from output_capture import OutputArtifact, StreamCapture, build_capture
 from timeutil import now_iso
 from winproc import CREATE_NEW_PROCESS_GROUP, get_process_start_time_iso, terminate_process_tree
@@ -55,6 +56,7 @@ def redact_command(argv: list[str]) -> list[str]:
 FIXED_INSTRUCTION_TEMPLATE = (
     "あなたは{agent_name}です。\n"
     "UIDは{uid}です。\n"
+    "Invocation-IDは{invocation_id}です。\n"
     "\n"
     "プロジェクト内のmailパッケージを使い、自分宛ての未読メールを確認してください。\n"
     "引継ぎ情報がある場合は確認してください。\n"
@@ -283,11 +285,17 @@ class CliLauncher:
         self, agent: AgentDefinition, job_id: str, origin_mail_id: int, project_path: Path,
         attempt: int = 1, env_vars: dict[str, str] | None = None, invocation_id: str = "",
     ) -> LaunchedProcess:
+        invocation_id = resolve_launch_invocation_id(
+            invocation_id, env_vars, attempt=attempt
+        )
+        launch_env = dict(env_vars or {})
+        launch_env["AI_INVOCATION_ID"] = invocation_id
+        launch_env["INVOCATION_ID"] = invocation_id
         command = self._resolver.resolve(agent)
         adapter = self._adapters[agent.cli_type]
         argv = adapter.build_argv(command, project_path)
-        instruction = self._build_fixed_instruction(agent)
-        env = self._build_subprocess_env(extra_env=env_vars)
+        instruction = self._build_fixed_instruction(agent, invocation_id=invocation_id)
+        env = self._build_subprocess_env(extra_env=launch_env)
         launched_at = now_iso()
 
         creationflags = CREATE_NEW_PROCESS_GROUP if sys.platform == "win32" else 0
@@ -350,8 +358,10 @@ class CliLauncher:
         launched._start_capture()
         return launched
 
-    def _build_fixed_instruction(self, agent: AgentDefinition) -> str:
-        return FIXED_INSTRUCTION_TEMPLATE.format(agent_name=agent.name, uid=agent.uid)
+    def _build_fixed_instruction(self, agent: AgentDefinition, invocation_id: str = "") -> str:
+        return FIXED_INSTRUCTION_TEMPLATE.format(
+            agent_name=agent.name, uid=agent.uid, invocation_id=invocation_id
+        )
 
     def _build_subprocess_env(self, extra_env: dict[str, str] | None = None) -> dict[str, str]:
         env = os.environ.copy()
