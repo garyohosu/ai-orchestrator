@@ -16,12 +16,14 @@ from dispatch import (
     RoundTripCounter,
     extract_job_id,
 )
+from adapters.codex import CodexCliAdapter
 from launcher import CliLauncher, CliPathResolver
 from launcher import ProcessResult
 from adapters.base import CliEvidence
 from output_capture import OutputArtifact
 from logging_utils import JobLogger
 from mail_adapter import MailReplyQuery
+from rate_limit_store import RateLimitStore
 from runtime import RuntimeStateStore, TerminalStateStore
 from tests.fakes import FakeCliAdapter, InMemoryMailAdapter
 from timeutil import now_iso, shift_ms
@@ -37,7 +39,10 @@ def _agent(name: str, uid: str, stub: str, extra_args: list[str] | None = None) 
 class DispatchCycleHarness:
     """Wires a DispatchCycle with fresh temp dirs and a fake CLI adapter."""
 
-    def __init__(self, max_retries: int = 2, max_round_trips: int = 10) -> None:
+    def __init__(
+        self, max_retries: int = 2, max_round_trips: int = 10,
+        extra_adapters: dict | None = None, with_rate_limit_store: bool = False,
+    ) -> None:
         self._max_retries = max_retries
         self.mail = InMemoryMailAdapter()
         self.system_uid = self.mail.register_user("orchestrator")
@@ -47,6 +52,9 @@ class DispatchCycleHarness:
         self.runtime_dir = Path(tempfile.mkdtemp())
 
         adapters = {"fake": FakeCliAdapter("nonexistent-default-cli-xyz")}
+        adapters.update(extra_adapters or {})
+        self.adapters = adapters
+        self.rate_limit_store = RateLimitStore(self.runtime_dir) if with_rate_limit_store else None
         self.watcher = MailWatcher(self.mail)
         self.launcher = CliLauncher(CliPathResolver(adapters), adapters)
         self.reply_query = MailReplyQuery(self.mail)
@@ -111,6 +119,8 @@ class DispatchCycleHarness:
             project_path=self.project_path,
             cli_timeout_sec=10,
             reply_check_timeout_sec=2,
+            adapters=self.adapters,
+            rate_limit_store=self.rate_limit_store,
         )
 
 
@@ -146,11 +156,16 @@ class ExtractJobIdTests(unittest.TestCase):
         worker_uid = h.mail.register_user("worker")
         alt_uid = h.mail.register_user("alternate")
         worker = AgentDefinition(
-            name="worker", uid=worker_uid, cli_type="fake", command=[],
+            name="worker", uid=worker_uid, cli_type="fake", command=[sys.executable],
             fallback_agents=["alternate"],
         )
-        alternate = AgentDefinition(name="alternate", uid=alt_uid, cli_type="fake", command=[])
+        # Availability pre-screening (availability.py) resolves a candidate's
+        # command before it's offered as a fallback target, so this needs a
+        # command that actually exists on this machine -- sys.executable
+        # always does, and this test never launches it.
+        alternate = AgentDefinition(name="alternate", uid=alt_uid, cli_type="fake", command=[sys.executable])
         h.cycle._agents_by_name = {"worker": worker, "alternate": alternate}
+        h.cycle._adapters = {"fake": FakeCliAdapter()}
         h.cycle._system_sender_uid = h.system_uid
         origin = {"mail_id": 1, "subject": "[JOB-RATE] 依頼", "sender_uid": commander}
         result = ProcessResult(
@@ -171,6 +186,39 @@ class ExtractJobIdTests(unittest.TestCase):
     def test_rate_limited_has_no_delivery_retry(self) -> None:
         self.assertFalse(RetryPolicy(5).should_retry(OutcomeStatus.RATE_LIMITED, 1, False))
 
+    def test_handoff_mail_forwards_original_task_content(self) -> None:
+        # A candidate only ever sees mail addressed to its own UID -- the
+        # original task mail was addressed to the failed agent, so unless
+        # the handoff body carries it forward verbatim, a cold candidate
+        # has no way to discover what it's actually being asked to do.
+        h = DispatchCycleHarness()
+        commander = h.mail.register_user("commander")
+        worker_uid = h.mail.register_user("worker")
+        alt_uid = h.mail.register_user("alternate")
+        worker = AgentDefinition(
+            name="worker", uid=worker_uid, cli_type="fake", command=[sys.executable],
+            fallback_agents=["alternate"],
+        )
+        alternate = AgentDefinition(name="alternate", uid=alt_uid, cli_type="fake", command=[sys.executable])
+        h.cycle._agents_by_name = {"worker": worker, "alternate": alternate}
+        h.cycle._adapters = {"fake": FakeCliAdapter()}
+        h.cycle._system_sender_uid = h.system_uid
+        origin = {
+            "mail_id": 1, "subject": "[JOB-RATE2] 依頼件名テキスト",
+            "sender_uid": commander,
+            "body": "これは元の依頼本文です。SECRET_TASK_MARKER_12345を含む具体的な指示。",
+        }
+        result = ProcessResult(
+            exit_code=1, timed_out=False, duration_sec=0.1,
+            cli_evidence=CliEvidence(True, "codex.rate_limit.usage_limit", "stderr", "You've hit your usage limit"),
+        )
+        h.cycle._handoff_rate_limited(worker, "JOB-RATE2", origin, result, 0)
+        handoffs = h.mail.find_mails(sender_uid=h.system_uid, recipient_uid=alt_uid, request_id="JOB-RATE2")
+        self.assertEqual(len(handoffs), 1)
+        self.assertIn("SECRET_TASK_MARKER_12345", handoffs[0]["body"])
+        self.assertIn("依頼件名テキスト", handoffs[0]["body"])
+        self.assertIn("agent_reply.py", handoffs[0]["body"])
+
     def test_rate_limited_with_no_candidates_returns_no_handoff(self) -> None:
         h = DispatchCycleHarness()
         worker = AgentDefinition(name="worker", uid="UID000002", cli_type="fake", command=[])
@@ -184,6 +232,91 @@ class ExtractJobIdTests(unittest.TestCase):
             result, 0,
         )
         self.assertIsNone(outcome)
+
+
+class CodexToGrokFailoverTests(unittest.TestCase):
+    """End-to-end: a real Codex usage-limit failure fails over to a
+    fallback reviewer instead of ending the job (project failover
+    requirements, section 12: reviewer -> codex_reviewer -> usage limit
+    detected -> grok_reviewer -> COMPLETED, not a bare FAILED)."""
+
+    def _codex_agent(self, uid: str, fallback_agents: list[str]) -> AgentDefinition:
+        return AgentDefinition(
+            name="codex_reviewer", uid=uid, cli_type="codex",
+            command=[sys.executable, str(_STUBS_DIR / "codex_usage_limit.py")],
+            fallback_agents=fallback_agents,
+        )
+
+    def test_real_usage_limit_message_triggers_handoff_not_human_required(self) -> None:
+        h = DispatchCycleHarness(
+            max_retries=0, extra_adapters={"codex": CodexCliAdapter()}, with_rate_limit_store=True
+        )
+        commander = h.mail.register_user("commander")
+        codex_uid = h.mail.register_user("codex_reviewer")
+        grok_uid = h.mail.register_user("grok_reviewer")
+        h.mail.send_mail(commander, codex_uid, "[JOB-CSV-999] レビュー依頼", "b")
+        codex_agent = self._codex_agent(codex_uid, ["grok_reviewer"])
+        grok_agent = AgentDefinition(
+            name="grok_reviewer", uid=grok_uid, cli_type="fake", command=[sys.executable]
+        )
+        h.cycle._agents_by_name = {"codex_reviewer": codex_agent, "grok_reviewer": grok_agent}
+        h.cycle._system_sender_uid = h.system_uid
+
+        outcomes = h.cycle.run_one_pass([codex_agent])
+
+        self.assertEqual(outcomes[0].status, OutcomeStatus.RATE_LIMITED)
+        handoff_mails = h.mail.find_mails(sender_uid=h.system_uid, recipient_uid=grok_uid, request_id="JOB-CSV-999")
+        self.assertEqual(len(handoff_mails), 1)
+        self.assertIn("引継ぎ", handoff_mails[0]["subject"])
+        # Retry-at parsed from the real message must be persisted so a
+        # later candidate-selection pass skips codex_reviewer without
+        # re-attempting it.
+        record = h.rate_limit_store.get("codex_reviewer")
+        self.assertIsNotNone(record)
+        self.assertEqual(record.rule_id, "codex.rate_limit.usage_limit")
+        self.assertEqual(record.retry_at, "2026-08-08T17:17:00")
+        self.assertTrue(h.rate_limit_store.is_in_cooldown("codex_reviewer"))
+
+    def test_all_fallback_candidates_unavailable_yields_human_required_with_reasons(self) -> None:
+        h = DispatchCycleHarness(
+            max_retries=0, extra_adapters={"codex": CodexCliAdapter()}, with_rate_limit_store=True
+        )
+        commander = h.mail.register_user("commander")
+        codex_uid = h.mail.register_user("codex_reviewer")
+        antigravity_uid = h.mail.register_user("antigravity_reviewer")
+        h.mail.send_mail(commander, codex_uid, "[JOB-CSV-998] レビュー依頼", "b")
+        codex_agent = self._codex_agent(codex_uid, ["antigravity_reviewer"])
+        antigravity_agent = AgentDefinition(
+            name="antigravity_reviewer", uid=antigravity_uid, cli_type="antigravity"
+        )
+        h.cycle._agents_by_name = {"codex_reviewer": codex_agent, "antigravity_reviewer": antigravity_agent}
+        h.cycle._system_sender_uid = h.system_uid
+
+        outcomes = h.cycle.run_one_pass([codex_agent])
+
+        self.assertEqual(outcomes[0].status, OutcomeStatus.HUMAN_REQUIRED)
+        self.assertEqual(h.terminal_store.get_status(1), "HUMAN_REQUIRED")
+        checkpoint = h.checkpoint_store.load("JOB-CSV-998")
+        self.assertEqual(checkpoint.current_state, "HUMAN_REQUIRED")
+        # The notification/checkpoint reason must explain *why* the only
+        # configured fallback was skipped (section 14: "未試行候補がある
+        # 場合は、その理由"), not just "unknown failure".
+        self.assertTrue(any("antigravity_reviewer" in issue for issue in checkpoint.open_issues))
+        self.assertTrue(any("cli.not_installed" in issue for issue in checkpoint.open_issues))
+
+    def test_success_clears_a_prior_cooldown_record(self) -> None:
+        h = DispatchCycleHarness(max_retries=0, with_rate_limit_store=True)
+        h.rate_limit_store.record(
+            "worker", rule_id="codex.rate_limit.usage_limit", retry_at="2099-01-01T00:00:00", evidence="e"
+        )
+        commander = h.mail.register_user("commander")
+        worker = h.mail.register_user("worker")
+        h.mail.send_mail(commander, worker, "[JOB-A] 依頼", "b")
+        agent = _agent("worker", worker, "exit_success.py")
+        h.reply_after_launch(worker, commander, "[JOB-A] 完了", "b")
+        outcomes = h.cycle.run_one_pass([agent])
+        self.assertEqual(outcomes[0].status, OutcomeStatus.SUCCESS)
+        self.assertFalse(h.rate_limit_store.is_in_cooldown("worker"))
 
 
 class NoWorkAndOrderingTests(unittest.TestCase):

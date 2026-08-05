@@ -10,11 +10,14 @@ from output_capture import OutputArtifact
 
 class DirectorCliAdapter:
     cli_type = "director"
+    prompt_transport = "stdin"
 
     def default_command_name(self) -> str:
         return "py"
 
-    def build_argv(self, command: list[str], project_path: Path) -> list[str]:
+    def build_argv(
+        self, command: list[str], project_path: Path, prompt_path: Path | None = None
+    ) -> list[str]:
         return [*command, "--once"]
 
     def classify_output(self, exit_code: int | None, timed_out: bool, stdout: OutputArtifact, stderr: OutputArtifact) -> CliEvidence:

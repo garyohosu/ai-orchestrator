@@ -26,7 +26,7 @@ DEFAULT_TERMINAL_GRACE_SEC = 2
 
 # Same contract as mail/SPEC.md's UID format: "UID" + 6 or more ASCII digits.
 _UID_PATTERN = re.compile(r"^UID[0-9]{6,}$")
-_KNOWN_CLI_TYPES = ("codex", "claude_code", "director")
+_KNOWN_CLI_TYPES = ("codex", "claude_code", "director", "grok", "antigravity")
 
 
 class ConfigValidationError(Exception):
@@ -41,6 +41,13 @@ class AgentDefinition:
     command: list[str] = field(default_factory=list)
     order_index: int = 0
     fallback_agents: list[str] = field(default_factory=list)
+    # Logical capability this agent can be selected for (e.g. "reviewer",
+    # "designer"). Optional and purely descriptive at the config layer --
+    # candidate *ordering* for a role lives in OrchestratorConfig.role_candidates,
+    # not on the agent entry itself, so one place (role_candidates) controls
+    # "who do we try, in what order" instead of it being implicit from scanning
+    # every agent's role field.
+    role: str | None = None
 
 
 @dataclass(frozen=True)
@@ -62,6 +69,10 @@ class OrchestratorConfig:
     max_handoffs: int
     terminal_poll_interval_sec: int
     terminal_grace_sec: int
+    # role name -> ordered list of agent names to try for that capability.
+    # Config-driven so candidate order (e.g. reviewer: codex_reviewer then
+    # grok_reviewer then ...) is never hardcoded in dispatch.py.
+    role_candidates: dict[str, list[str]] = field(default_factory=dict)
 
 
 def _positive_int(data: dict[str, Any], key: str, default: int) -> int:
@@ -99,6 +110,9 @@ def _parse_agents(raw_agents: Any) -> list[AgentDefinition]:
         cli_type = entry.get("cli_type")
         command = entry.get("command", [])
         fallback_agents = entry.get("fallback_agents", [])
+        role = entry.get("role")
+        if role is not None and not isinstance(role, str):
+            raise ConfigValidationError(f"agents[{index}].role must be a string or absent")
         if not isinstance(name, str) or not name:
             raise ConfigValidationError(f"agents[{index}].name must be a non-empty string")
         if cli_type == "director" and uid == "AUTO":
@@ -124,7 +138,7 @@ def _parse_agents(raw_agents: Any) -> list[AgentDefinition]:
         agents.append(
             AgentDefinition(
                 name=name, uid=uid, cli_type=cli_type, command=list(command), order_index=index,
-                fallback_agents=list(fallback_agents),
+                fallback_agents=list(fallback_agents), role=role,
             )
         )
     for agent in agents:
@@ -138,6 +152,26 @@ def _parse_agents(raw_agents: Any) -> list[AgentDefinition]:
                     f"agent {agent.name!r} cannot use itself as a fallback"
                 )
     return agents
+
+
+def _parse_role_candidates(raw: Any, known_agent_names: set[str]) -> dict[str, list[str]]:
+    if raw is None:
+        return {}
+    if not isinstance(raw, dict):
+        raise ConfigValidationError("role_candidates must be an object")
+    result: dict[str, list[str]] = {}
+    for role, candidates in raw.items():
+        if not isinstance(role, str) or not role:
+            raise ConfigValidationError("role_candidates keys must be non-empty strings")
+        if not isinstance(candidates, list) or not all(isinstance(c, str) for c in candidates):
+            raise ConfigValidationError(f"role_candidates[{role!r}] must be a list of strings")
+        for candidate in candidates:
+            if candidate not in known_agent_names:
+                raise ConfigValidationError(
+                    f"role_candidates[{role!r}] references unknown agent {candidate!r}"
+                )
+        result[role] = list(candidates)
+    return result
 
 
 def load(path: Path) -> OrchestratorConfig:
@@ -163,6 +197,7 @@ def load(path: Path) -> OrchestratorConfig:
         if dir_key in data and not isinstance(data[dir_key], str):
             raise ConfigValidationError(f"{dir_key} must be a string")
 
+    parsed_agents = _parse_agents(data.get("agents"))
     config = OrchestratorConfig(
         mail_check_interval_sec=_positive_int(
             data, "mail_check_interval_sec", DEFAULT_MAIL_CHECK_INTERVAL_SEC
@@ -176,7 +211,7 @@ def load(path: Path) -> OrchestratorConfig:
         max_run_duration_sec=_nonnegative_int(
             data, "max_run_duration_sec", DEFAULT_MAX_RUN_DURATION_SEC
         ),
-        agents=_parse_agents(data.get("agents")),
+        agents=parsed_agents,
         project_path=project_path,
         logs_dir=data.get("logs_dir", DEFAULT_LOGS_DIR),
         checkpoints_dir=data.get("checkpoints_dir", DEFAULT_CHECKPOINTS_DIR),
@@ -193,5 +228,8 @@ def load(path: Path) -> OrchestratorConfig:
         max_handoffs=_nonnegative_int(data, "max_handoffs", DEFAULT_MAX_HANDOFFS),
         terminal_poll_interval_sec=_positive_int(data, "terminal_poll_interval_sec", DEFAULT_TERMINAL_POLL_INTERVAL_SEC),
         terminal_grace_sec=_positive_int(data, "terminal_grace_sec", DEFAULT_TERMINAL_GRACE_SEC),
+        role_candidates=_parse_role_candidates(
+            data.get("role_candidates"), {agent.name for agent in parsed_agents}
+        ),
     )
     return config

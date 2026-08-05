@@ -15,7 +15,7 @@ from invocation import (
     resolve_launch_invocation_id,
 )
 from launcher import CliLauncher, CliNotFoundError, CliPathResolver, redact_command
-from tests.fakes import FakeCliAdapter
+from tests.fakes import FakeCliAdapter, FakePromptFileCliAdapter
 
 _STUBS_DIR = Path(__file__).resolve().parent / "stubs"
 
@@ -340,6 +340,113 @@ with open(r"{out_path}", "w", encoding="utf-8") as f:
         self.assertIn("Invocation-IDはINV-METADATA-123です。", captured)
         self.assertIn("Parent-Invocation-IDはnullです", captured)
         self.assertIn("文字列のnoneではなくJSONのnull", captured)
+
+
+class PromptFileTransportTests(unittest.TestCase):
+    """prompt_transport="prompt_file" lifecycle (write, argv, cleanup)."""
+
+    def setUp(self) -> None:
+        self.project_path = Path(tempfile.mkdtemp())
+
+    def _agent(self) -> AgentDefinition:
+        return AgentDefinition(
+            name="grok_reviewer", uid="UID000006", cli_type="fake_prompt_file",
+            command=[sys.executable, str(_STUBS_DIR / "echo_prompt_file.py")],
+        )
+
+    def _launcher(self, out_path: Path) -> CliLauncher:
+        adapters = {"fake_prompt_file": FakePromptFileCliAdapter(out_path)}
+        return CliLauncher(CliPathResolver(adapters), adapters)
+
+    def test_prompt_delivered_via_file_not_stdin(self) -> None:
+        out_path = self.project_path / "captured.txt"
+        launcher = self._launcher(out_path)
+        launched = launcher.launch(self._agent(), "JOB-CSV-004", 1, self.project_path)
+        prompt_path = launched._prompt_file_path
+        self.assertIsNotNone(prompt_path)
+        self.assertTrue(prompt_path.is_file())
+        result = launched.wait(timeout_sec=10)
+        self.assertEqual(result.exit_code, 0)
+        captured = out_path.read_text(encoding="utf-8")
+        self.assertIn(f"PROMPT_FILE_PATH:{prompt_path}", captured)
+        self.assertIn("STDIN_LEN:0", captured)  # nothing delivered over stdin
+        self.assertIn("あなたはgrok_reviewerです。".encode("utf-8").decode("utf-8"), captured)
+
+    def test_prompt_body_never_appears_in_argv(self) -> None:
+        out_path = self.project_path / "captured.txt"
+        launcher = self._launcher(out_path)
+        launched = launcher.launch(self._agent(), "JOB-CSV-004", 1, self.project_path)
+        self.assertNotIn("あなたは", " ".join(launched.launch_command))
+        launched.wait(timeout_sec=10)
+
+    def test_prompt_file_deleted_after_success(self) -> None:
+        out_path = self.project_path / "captured.txt"
+        launcher = self._launcher(out_path)
+        launched = launcher.launch(self._agent(), "JOB-CSV-004", 1, self.project_path)
+        prompt_path = launched._prompt_file_path
+        launched.wait(timeout_sec=10)
+        self.assertFalse(prompt_path.exists())
+
+    def test_prompt_file_deleted_after_nonzero_exit(self) -> None:
+        out_path = self.project_path / "captured.txt"
+        adapters = {"fake_prompt_file": FakePromptFileCliAdapter(out_path)}
+        launcher = CliLauncher(CliPathResolver(adapters), adapters)
+        agent = AgentDefinition(
+            name="grok_reviewer", uid="UID000006", cli_type="fake_prompt_file",
+            # exit_fail.py ignores argv, always exits 1 -- exercises the
+            # nonzero-exit cleanup path, not echo_prompt_file.py's own logic.
+            command=[sys.executable, str(_STUBS_DIR / "exit_fail.py")],
+        )
+        launched = launcher.launch(agent, "JOB-CSV-004", 1, self.project_path)
+        prompt_path = launched._prompt_file_path
+        self.assertTrue(prompt_path.exists())
+        result = launched.wait(timeout_sec=10)
+        self.assertEqual(result.exit_code, 1)
+        self.assertFalse(prompt_path.exists())
+
+    def test_prompt_file_deleted_after_timeout(self) -> None:
+        out_path = self.project_path / "captured.txt"
+        adapters = {"fake_prompt_file": FakePromptFileCliAdapter(out_path)}
+        launcher = CliLauncher(CliPathResolver(adapters), adapters)
+        agent = AgentDefinition(
+            name="grok_reviewer", uid="UID000006", cli_type="fake_prompt_file",
+            command=[sys.executable, str(_STUBS_DIR / "sleep_forever.py")],
+        )
+        launched = launcher.launch(agent, "JOB-CSV-004", 1, self.project_path)
+        prompt_path = launched._prompt_file_path
+        self.assertTrue(prompt_path.exists())
+        result = launched.wait(timeout_sec=1)
+        self.assertTrue(result.timed_out)
+        self.assertFalse(prompt_path.exists())
+
+    def test_prompt_file_deleted_on_launch_failure(self) -> None:
+        out_path = self.project_path / "captured.txt"
+        adapters = {"fake_prompt_file": FakePromptFileCliAdapter(out_path)}
+        launcher = CliLauncher(CliPathResolver(adapters), adapters)
+        agent = AgentDefinition(
+            name="grok_reviewer", uid="UID000006", cli_type="fake_prompt_file",
+            command=["definitely-nonexistent-cli-xyz-12345"],
+        )
+        before = set(Path(tempfile.gettempdir()).glob("orchestrator-prompt-JOB-CSV-004-*"))
+        with self.assertRaises(CliNotFoundError):
+            launcher.launch(agent, "JOB-CSV-004", 1, self.project_path)
+        after = set(Path(tempfile.gettempdir()).glob("orchestrator-prompt-JOB-CSV-004-*"))
+        self.assertEqual(before, after)  # no orphaned temp file left behind
+
+    def test_concurrent_attempts_do_not_collide(self) -> None:
+        out_path_1 = self.project_path / "captured1.txt"
+        out_path_2 = self.project_path / "captured2.txt"
+        launcher1 = self._launcher(out_path_1)
+        launcher2 = CliLauncher(
+            CliPathResolver({"fake_prompt_file": FakePromptFileCliAdapter(out_path_2)}),
+            {"fake_prompt_file": FakePromptFileCliAdapter(out_path_2)},
+        )
+        agent = self._agent()
+        launched1 = launcher1.launch(agent, "JOB-CSV-004", 1, self.project_path)
+        launched2 = launcher2.launch(agent, "JOB-CSV-004", 1, self.project_path)
+        self.assertNotEqual(launched1._prompt_file_path, launched2._prompt_file_path)
+        launched1.wait(timeout_sec=10)
+        launched2.wait(timeout_sec=10)
 
 
 class RedactCommandTests(unittest.TestCase):

@@ -229,8 +229,27 @@ class MailReplyQuery:
             ):
                 continue
             if expected.require_structured_context:
+                # expected.decision_id is empty/None precisely when the
+                # origin/trigger mail carried no [DEC-...] bracket -- i.e.
+                # nothing was known in advance to compare against. That is
+                # the director bootstrap case (director mints the first
+                # Decision-ID itself; SPEC.md 6章). invocation_id (checked
+                # above via _invocation_matches) and job_id (checked just
+                # above) already authenticate the reply, so an empty
+                # expectation must not reject an otherwise-matching,
+                # newly-minted decision_id -- that would just be an
+                # unconditional rejection with no safety value. When an
+                # expected decision_id IS known in advance (the normal
+                # worker/commander case, since director authors those
+                # DELEGATE/DECISION_REQUEST subjects itself), exact
+                # matching is still enforced. The key itself must still be
+                # present in the structured payload either way -- a reply
+                # that omits decision_id entirely is an incomplete
+                # correlation payload, not an empty-expectation match.
+                if "decision_id" not in payload:
+                    continue
                 body_decision_id = payload.get("decision_id")
-                if body_decision_id != expected.decision_id:
+                if expected.decision_id and body_decision_id != expected.decision_id:
                     continue
             elif expected.decision_id:
                 body_decision_id = payload.get("decision_id")

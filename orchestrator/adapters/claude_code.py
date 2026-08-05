@@ -11,17 +11,21 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import error_taxonomy as et
 from adapters.base import CliEvidence
 from output_capture import OutputArtifact
 
 
 class ClaudeCodeCliAdapter:
     cli_type = "claude_code"
+    prompt_transport = "stdin"
 
     def default_command_name(self) -> str:
         return "claude"
 
-    def build_argv(self, command: list[str], project_path: Path) -> list[str]:
+    def build_argv(
+        self, command: list[str], project_path: Path, prompt_path: Path | None = None
+    ) -> list[str]:
         # "-p" (print mode) runs one non-interactive turn and exits; the
         # fixed instruction is delivered via stdin by the launcher.
         return [*command, "-p"]
@@ -40,8 +44,10 @@ class ClaudeCodeCliAdapter:
             if needle in artifact.tail.lower():
                 return CliEvidence(
                     rate_limited=True,
-                    rule_id="claude.rate_limit.session_limit",
+                    rule_id=et.RATE_LIMIT_CLAUDE,
                     stream=stream_name,
                     evidence="You've hit your session limit",
+                    category=et.CATEGORY_RATE_LIMIT,
+                    provider="claude_code",
                 )
         return CliEvidence()

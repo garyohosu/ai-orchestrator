@@ -137,10 +137,29 @@ class FakeCliAdapter:
 
     def __init__(self, default_name: str = "fake-cli") -> None:
         self.cli_type = "fake"
+        self.prompt_transport = "stdin"
         self._default_name = default_name
 
     def default_command_name(self) -> str:
         return self._default_name
 
-    def build_argv(self, command: list[str], project_path) -> list[str]:
+    def build_argv(self, command: list[str], project_path, prompt_path=None) -> list[str]:
         return list(command)
+
+
+class FakePromptFileCliAdapter:
+    """A prompt_transport="prompt_file" CliAdapter for testing launcher.py's
+    temp-file delivery path without depending on the real Grok CLI."""
+
+    def __init__(self, out_path, default_name: str = "fake-prompt-file-cli") -> None:
+        self.cli_type = "fake_prompt_file"
+        self.prompt_transport = "prompt_file"
+        self._default_name = default_name
+        self._out_path = out_path
+
+    def default_command_name(self) -> str:
+        return self._default_name
+
+    def build_argv(self, command: list[str], project_path, prompt_path=None) -> list[str]:
+        assert prompt_path is not None
+        return [*command, "--prompt-file", str(prompt_path), "--out", str(self._out_path)]

@@ -469,6 +469,60 @@ class MailReplyQueryTests(unittest.TestCase):
         self.assertTrue(result.found)
         self.assertEqual(result.result_mail_uid, accepted)
 
+    def test_bootstrap_reply_with_minted_decision_id_is_accepted(self) -> None:
+        # Regression test: an origin mail without a [DEC-...] bracket makes
+        # dispatch._attempt_launch() build ExpectedReply(decision_id="").
+        # Director (SPEC.md 6章) mints its own first Decision-ID for such a
+        # bootstrap request and includes that real, non-empty value in its
+        # correlated reply. That reply must still be accepted: invocation_id
+        # and job_id already authenticate it, and there is nothing to
+        # validate the decision_id against when none was expected.
+        # Reproduces the JOB-CSV-002 live NO_REPLY misclassification.
+        origin_id = self.mail.send_mail(
+            self.commander, self.worker, "[JOB-BOOT] request", "plain task"
+        )
+        payload = {
+            "status": "WAITING_FOR_WORKER",
+            "invocation_result": "WAITING",
+            "job_id": "JOB-BOOT",
+            "decision_id": "DEC-20260804T044006Z-01-DB52",
+            "invocation_id": "INV-BOOT-RESULT",
+            "parent_invocation_id": None,
+            "root_invocation_id": "INV-BOOT-RESULT",
+            "trigger_mail_uid": origin_id,
+        }
+        expected = ExpectedReply(
+            job_id="JOB-BOOT",
+            sender_uid=self.worker,
+            recipient_uid="",
+            origin_mail_id=origin_id,
+            not_before_iso=shift_ms(now_iso(), -60_000),
+            invocation_id="INV-BOOT-RESULT",
+            max_mail_id=origin_id,
+            decision_id="",
+            parent_invocation_id=None,
+            root_invocation_id="INV-BOOT-RESULT",
+            trigger_mail_uid=origin_id,
+            require_structured_context=True,
+        )
+        accepted = self.mail.send_mail(
+            self.worker, self.commander, "minted decision", json.dumps(payload)
+        )
+        result = self.query.find_terminal_reply(expected)
+        self.assertTrue(result.found)
+        self.assertEqual(result.result_mail_uid, accepted)
+
+        # The safety layer (invocation_id matching) must still hold: a wrong
+        # invocation_id with the same minted decision_id is still rejected.
+        wrong_payload = dict(payload)
+        wrong_payload["invocation_id"] = "INV-WRONG"
+        self.mail.send_mail(
+            self.worker, self.commander, "wrong invocation id", json.dumps(wrong_payload)
+        )
+        self.mail._mails[-1]["is_read"] = True
+        second = self.query.find_terminal_reply(expected)
+        self.assertEqual(second.result_mail_uid, accepted)
+
     def test_structured_result_rejects_status_result_contradiction(self) -> None:
         origin_id = self.mail.send_mail(
             self.commander, self.worker, "[JOB-C] [DEC-C] request", "{}"

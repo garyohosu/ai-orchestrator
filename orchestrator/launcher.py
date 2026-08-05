@@ -16,6 +16,7 @@ from adapters.base import CliAdapter, CliEvidence
 from config import AgentDefinition
 from invocation import resolve_launch_invocation_id
 from output_capture import OutputArtifact, StreamCapture, build_capture
+from prompt_delivery import PromptFileError, delete_prompt_file, write_prompt_file
 from timeutil import now_iso
 from winproc import CREATE_NEW_PROCESS_GROUP, get_process_start_time_iso, terminate_process_tree
 
@@ -150,6 +151,7 @@ class LaunchedProcess:
         stdout_capture: StreamCapture,
         stderr_capture: StreamCapture,
         invocation_id: str = "",
+        prompt_file_path: Path | None = None,
     ) -> None:
         self._popen = popen
         self.pid = popen.pid
@@ -163,8 +165,17 @@ class LaunchedProcess:
         self._stdout_capture = stdout_capture
         self._stderr_capture = stderr_capture
         self.invocation_id = invocation_id
+        self._prompt_file_path = prompt_file_path
+        self._prompt_file_cleaned = False
         self._capture_threads: list[threading.Thread] = []
         self._capture_started = False
+
+    def cleanup_prompt_file(self) -> None:
+        """Delete the prompt_file temp file, if any. Idempotent, never raises."""
+        if self._prompt_file_cleaned:
+            return
+        self._prompt_file_cleaned = True
+        delete_prompt_file(self._prompt_file_path)
 
     def _start_capture(self) -> None:
         if self._capture_started:
@@ -278,13 +289,23 @@ class LaunchedProcess:
                 continue
         if timed_out:
             timed_out = True
-        stdout, stderr = self._finish_capture()
-        classify_output = getattr(self._adapter, "classify_output", None)
-        evidence = (
-            classify_output(exit_code, timed_out, stdout, stderr)
-            if classify_output is not None
-            else CliEvidence()
-        )
+        # The process is confirmed exited or forcibly terminated by every
+        # break path above, so it can no longer be reading a prompt_file
+        # temp file -- safe to delete now. Covers success, nonzero exit,
+        # and timeout; launch()'s own except-branches cover launch failure,
+        # and this method's try/finally covers any exception raised below.
+        try:
+            self.cleanup_prompt_file()
+            stdout, stderr = self._finish_capture()
+            classify_output = getattr(self._adapter, "classify_output", None)
+            evidence = (
+                classify_output(exit_code, timed_out, stdout, stderr)
+                if classify_output is not None
+                else CliEvidence()
+            )
+        except BaseException:
+            self.cleanup_prompt_file()
+            raise
         duration_sec = time.monotonic() - started
         return ProcessResult(
             exit_code=exit_code,
@@ -342,7 +363,7 @@ class CliLauncher:
         launch_env.setdefault("AI_TRIGGER_MAIL_UID", str(origin_mail_id))
         command = self._resolver.resolve(agent)
         adapter = self._adapters[agent.cli_type]
-        argv = adapter.build_argv(command, project_path)
+        prompt_transport = getattr(adapter, "prompt_transport", "stdin")
         instruction = self._build_fixed_instruction(
             agent,
             invocation_id=invocation_id,
@@ -350,6 +371,20 @@ class CliLauncher:
             root_invocation_id=launch_env.get("AI_ROOT_INVOCATION_ID", invocation_id),
             trigger_mail_uid=launch_env.get("AI_TRIGGER_MAIL_UID", "unknown"),
         )
+
+        prompt_file_path: Path | None = None
+        if prompt_transport == "prompt_file":
+            try:
+                prompt_file_path = write_prompt_file(
+                    instruction, job_id=job_id, agent_name=agent.name, attempt=attempt
+                )
+            except PromptFileError as err:
+                # No process (and no temp file left behind: write_prompt_file
+                # cleans up after itself on failure) -- same DELIVERY_FAILED
+                # territory as a missing CLI executable.
+                raise CliNotFoundError(str(err)) from err
+
+        argv = adapter.build_argv(command, project_path, prompt_file_path)
         env = self._build_subprocess_env(extra_env=launch_env)
         launched_at = now_iso()
 
@@ -370,14 +405,24 @@ class CliLauncher:
             # (e.g. "not a valid Win32 application"). Either way, the
             # process never started, so this is DELIVERY_FAILED territory
             # (SPEC.md 26章), not an unhandled crash.
+            delete_prompt_file(prompt_file_path)
             raise CliNotFoundError(f"failed to start CLI for {agent.name!r}: {err}") from err
-        try:
-            popen.stdin.write(instruction.encode("utf-8"))
-            popen.stdin.close()
-        except (BrokenPipeError, OSError):
-            # The process may have exited immediately; wait() will surface
-            # the resulting non-zero/failed status.
-            pass
+        if prompt_transport == "prompt_file":
+            # The instruction was already delivered via the temp file; stdin
+            # carries nothing. Close it so a CLI that happens to check stdin
+            # sees a clean EOF rather than hanging.
+            try:
+                popen.stdin.close()
+            except (BrokenPipeError, OSError):
+                pass
+        else:
+            try:
+                popen.stdin.write(instruction.encode("utf-8"))
+                popen.stdin.close()
+            except (BrokenPipeError, OSError):
+                # The process may have exited immediately; wait() will surface
+                # the resulting non-zero/failed status.
+                pass
 
         # Never substitute launched_at (our own clock) for a missing OS
         # start time: is_same_running_process() would then compare against
@@ -407,6 +452,7 @@ class CliLauncher:
             stdout_capture=stdout_capture,
             stderr_capture=stderr_capture,
             invocation_id=invocation_id,
+            prompt_file_path=prompt_file_path,
         )
         # Start drainers before returning so a fast CLI cannot fill a pipe
         # during the caller's small gap before wait().

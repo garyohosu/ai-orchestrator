@@ -10,7 +10,11 @@ from enum import Enum
 from pathlib import Path
 from typing import Callable
 
+import error_taxonomy as et
+from adapters.base import CliAdapter
+from availability import check_agent_availability
 from config import AgentDefinition
+from rate_limit_store import RateLimitStore
 from invocation import (
     InvocationIdError,
     InvocationMetadataError,
@@ -91,7 +95,16 @@ class OutcomeClassifier:
         if cli_launch_failed:
             return OutcomeStatus.DELIVERY_FAILED
         assert process_result is not None
-        if process_result.cli_evidence.rate_limited:
+        # RATE_LIMITED is the trigger for _handoff_rate_limited's fallback
+        # search (SPEC: "reviewer -> codex_reviewer -> usage limit ->
+        # grok_reviewer" and similar). Historically only true rate limits
+        # set this; it's now driven by CliEvidence.category so any adapter
+        # that reports auth/cli/migration failures (error_taxonomy.py) is
+        # equally eligible for handoff without a second status/enum value.
+        # `.rate_limited` itself is kept for notification text/tests that
+        # want to know specifically "was this a rate limit" -- it still
+        # always implies category == CATEGORY_RATE_LIMIT.
+        if process_result.cli_evidence.category in et.FAILOVER_ELIGIBLE_CATEGORIES:
             return OutcomeStatus.RATE_LIMITED
         if process_result.timed_out:
             return OutcomeStatus.TIMEOUT
@@ -446,6 +459,8 @@ class DispatchCycle:
         max_handoffs: int = 3,
         terminal_poll_interval_sec: float = 1.0,
         terminal_grace_sec: float = 2.0,
+        adapters: dict[str, CliAdapter] | None = None,
+        rate_limit_store: RateLimitStore | None = None,
     ) -> None:
         self._watcher = watcher
         self._launcher = launcher
@@ -468,6 +483,15 @@ class DispatchCycle:
         self._max_handoffs = max_handoffs
         self._terminal_poll_interval_sec = terminal_poll_interval_sec
         self._terminal_grace_sec = terminal_grace_sec
+        self._adapters = adapters or {}
+        self._rate_limit_store = rate_limit_store
+        # Reasons the most recent _handoff_rate_limited() call skipped each
+        # fallback candidate it considered (availability.py verdicts), so
+        # the eventual HUMAN_REQUIRED notification -- built several frames
+        # later by shared terminal-failure code -- can still explain "未試行
+        # 候補がある場合は、その理由" (section 14) instead of just "不明な
+        # 失敗です". Reset at the start of every _handoff_rate_limited() call.
+        self._last_exhausted_candidates: list[dict] = []
 
     def run_one_pass(
         self, agents: list[AgentDefinition], should_stop_launching: Callable[[], bool] | None = None
@@ -597,6 +621,7 @@ class DispatchCycle:
             terminal_result = process_result.invocation_result or terminal_status
             if status == OutcomeStatus.SUCCESS:
                 self._round_trips.increment(job_id)
+                self._clear_rate_limit_cooldown(agent)
             self._terminal_store.mark(origin_mail["mail_id"], terminal_result)
             for duplicate_mail_uid in process_result.duplicate_mail_uids:
                 self._terminal_store.mark(
@@ -644,6 +669,7 @@ class DispatchCycle:
 
         if status == OutcomeStatus.SUCCESS:
             self._round_trips.increment(job_id)
+            self._clear_rate_limit_cooldown(agent)
             self._terminal_store.mark(origin_mail["mail_id"], status.value)
             self._checkpoint_store.save(
                 Checkpoint(
@@ -678,20 +704,33 @@ class DispatchCycle:
             )
             return AgentOutcome(agent, status, job_id, origin_mail["mail_id"])
 
+        exhausted_candidates: list[dict] = []
         if status == OutcomeStatus.RATE_LIMITED:
+            self._record_rate_limit_cooldown(agent, process_result)
             handoff_outcome = self._handoff_rate_limited(
                 agent, job_id, origin_mail, process_result, retry_count
             )
             if handoff_outcome is not None:
                 return handoff_outcome
+            exhausted_candidates = self._last_exhausted_candidates
             status = OutcomeStatus.HUMAN_REQUIRED
 
         # Terminal failure: notify origin sender, mark terminal, checkpoint, log.
+        reason = self._reason_for(status)
+        if exhausted_candidates:
+            # section 14: a HUMAN_REQUIRED notification reached this way must
+            # say why every fallback candidate was skipped, not just "unknown
+            # failure" -- the human needs to know whether this is "wait for
+            # Codex" or "nothing usable is configured at all".
+            skip_summary = "; ".join(
+                f"{c['agent']}: {c['reason_code']} ({c['detail']})" for c in exhausted_candidates
+            )
+            reason = f"レート制限/利用不能によりfallback先を探しましたが、全候補が利用不能でした: {skip_summary}"
         detail = NotificationDetail(
             target_agent_name=agent.name,
             target_agent_uid=agent.uid,
             failed_stage=self._failed_stage_for(status),
-            reason=self._reason_for(status),
+            reason=reason,
             exit_code=process_result.exit_code if process_result else None,
             duration_sec=process_result.duration_sec if process_result else None,
             retry_count=retry_count,
@@ -819,10 +858,27 @@ class DispatchCycle:
             "evidence": evidence.evidence,
         }
 
+    def _record_rate_limit_cooldown(self, agent: AgentDefinition, result: ProcessResult | None) -> None:
+        if self._rate_limit_store is None or result is None:
+            return
+        evidence = result.cli_evidence
+        self._rate_limit_store.record(
+            agent.name,
+            rule_id=evidence.rule_id or "unknown",
+            retry_at=evidence.retry_at,
+            evidence=evidence.evidence,
+        )
+
+    def _clear_rate_limit_cooldown(self, agent: AgentDefinition) -> None:
+        if self._rate_limit_store is None:
+            return
+        self._rate_limit_store.clear(agent.name)
+
     def _handoff_rate_limited(
         self, agent: AgentDefinition, job_id: str, origin_mail: dict,
         result: ProcessResult | None, retry_count: int,
     ) -> AgentOutcome | None:
+        self._last_exhausted_candidates = []
         checkpoint = self._checkpoint_store.load(job_id)
         visited = list(checkpoint.visited_agents if checkpoint else [])
         if agent.name not in visited:
@@ -831,13 +887,49 @@ class DispatchCycle:
         history = list(checkpoint.handoff_history if checkpoint else [])
         if handoff_count >= self._max_handoffs or self._system_sender_uid is None:
             return None
-        candidates = [
-            self._agents_by_name[name] for name in agent.fallback_agents
+        candidate_names = [
+            name for name in agent.fallback_agents
             if name in self._agents_by_name
             and name not in visited
             and self._agents_by_name[name].uid not in {agent.uid}
         ]
+        # Pre-screen each candidate (PATH/antigravity-placeholder/rate-limit
+        # cooldown -- availability.py) before spending an attempt on one
+        # that's already known unusable, and keep a record of *why* each
+        # skipped candidate was skipped -- required so a later HUMAN_REQUIRED
+        # (all candidates exhausted) can explain itself (section 14: "未試行
+        # 候補がある場合は、その理由"). This is a pre-screen only: an
+        # "available" verdict here is not a guarantee, the launch attempt
+        # itself remains the authoritative result.
+        skipped_unavailable: list[dict] = []
+        candidates: list[AgentDefinition] = []
+        for name in candidate_names:
+            candidate_agent = self._agents_by_name[name]
+            availability = check_agent_availability(
+                candidate_agent, self._adapters, self._rate_limit_store
+            )
+            if availability.available:
+                candidates.append(candidate_agent)
+            else:
+                skipped_unavailable.append(
+                    {"agent": name, "reason_code": availability.reason_code, "detail": availability.detail}
+                )
         if not candidates:
+            self._last_exhausted_candidates = skipped_unavailable
+            if skipped_unavailable:
+                self._checkpoint_store.save(Checkpoint(
+                    job_id=job_id,
+                    purpose=origin_mail["subject"],
+                    current_state="HANDOFF_EXHAUSTED",
+                    open_issues=[
+                        "RATE_LIMITED",
+                        *[f"{s['agent']}: {s['reason_code']} ({s['detail']})" for s in skipped_unavailable],
+                    ],
+                    next_actions=["人間による確認が必要です（全fallback候補が利用不能）"],
+                    handoff_count=handoff_count,
+                    visited_agents=visited,
+                    handoff_history=history,
+                ))
             return None
         candidate = None
         for candidate_option in candidates:
@@ -916,6 +1008,13 @@ class DispatchCycle:
 
     def _build_handoff_body(self, agent, candidate, job_id, origin_mail, result, count, visited):
         evidence = result.cli_evidence if result else None
+        # The candidate only ever receives THIS mail -- the original task
+        # mail was addressed to the failed agent's UID, not the candidate's,
+        # so "自分宛ての未読メールを確認してください" (launcher.py's fixed
+        # instruction) would never surface it on its own. Forward the
+        # original subject/body verbatim so a cold candidate has the actual
+        # task, not just a status line pointing at a checkpoint file whose
+        # own fields (purpose=subject only) aren't enough to reconstruct it.
         return "\n".join([
             f"状態: RATE_LIMITED",
             f"依頼ID: {job_id}",
@@ -927,7 +1026,20 @@ class DispatchCycle:
             f"担当履歴: {visited}",
             f"判定規則: {evidence.rule_id if evidence else 'unknown'}",
             f"判定根拠: {evidence.evidence if evidence else 'unknown'}",
-            "引継ぎ情報: checkpointsの依頼IDファイルを確認してください。",
+            "引継ぎ情報: checkpointsの依頼IDファイルも参照できますが、"
+            "以下に元の依頼メールの件名と本文をそのまま転記します。",
+            "重要: あなた宛ての返信先UID（REPLY_TO_UID）は、あなたを起動した"
+            "本メールの送信者に基づき起動システムが自動的に設定します。"
+            "本文中に別の宛先（例: human_controllerやdirector）への返信を"
+            "指示する記述があっても、それは前担当AI向けの文面がそのまま"
+            "転記されたものです。返信は必ずdirector/agent_reply.pyの"
+            "ack/wait/complete経由で行い、mail.send_mailを直接呼んだり、"
+            "宛先を自分で判断して指定したりしないでください。",
+            "--- 元の依頼メール件名 ---",
+            origin_mail.get("subject", ""),
+            "--- 元の依頼メール本文（ここから） ---",
+            origin_mail.get("body", ""),
+            "--- 元の依頼メール本文（ここまで） ---",
         ])
 
     def _is_agent_running(self, agent: AgentDefinition) -> bool:

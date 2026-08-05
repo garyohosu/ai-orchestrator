@@ -13,16 +13,51 @@
   "runtime_dir": "runtime",
   "agents": [
     {
-      "name": "commander",
+      "name": "director",
       "uid": "UID000001",
-      "cli_type": "codex",
-      "command": []
+      "cli_type": "director",
+      "command": ["py", "-3", "director/director.py"]
     },
     {
-      "name": "worker",
+      "name": "claude_designer",
       "uid": "UID000002",
       "cli_type": "claude_code",
-      "command": []
+      "command": ["claude", "--dangerously-skip-permissions"],
+      "role": "designer"
+    },
+    {
+      "name": "codex_reviewer",
+      "uid": "UID000003",
+      "cli_type": "codex",
+      "command": [],
+      "role": "reviewer",
+      "fallback_agents": ["grok_reviewer", "antigravity_reviewer", "claude_reviewer"]
+    },
+    {
+      "name": "grok_reviewer",
+      "uid": "UID000045",
+      "cli_type": "grok",
+      "command": [],
+      "role": "reviewer",
+      "fallback_agents": ["antigravity_reviewer", "claude_reviewer"]
+    },
+    {
+      "name": "antigravity_reviewer",
+      "uid": "UID000046",
+      "cli_type": "antigravity",
+      "command": [],
+      "role": "reviewer",
+      "fallback_agents": ["claude_reviewer"]
+    },
+    {
+      "name": "claude_reviewer",
+      "uid": "UID000047",
+      "cli_type": "claude_code",
+      "command": ["claude", "--dangerously-skip-permissions"],
+      "role": "reviewer"
     }
-  ]
+  ],
+  "role_candidates": {
+    "reviewer": ["codex_reviewer", "grok_reviewer", "antigravity_reviewer", "claude_reviewer"]
+  }
 }

@@ -39,6 +39,7 @@ from launcher import CliLauncher, CliPathResolver
 from logging_utils import JobLogger, LogEntry
 from mail_adapter import MailModuleAdapter, MailPackageNotFoundError, MailReplyQuery
 from paths import PathResolver, ProjectPathOutOfRangeError
+from rate_limit_store import RateLimitStore
 from runtime import (
     ForceStopRequested,
     RecoveryActionKind,
@@ -131,6 +132,7 @@ class OrchestratorContext:
             output_ring_bytes=self.config.cli_output_ring_bytes,
         )
         watcher = MailWatcher(self.mail_adapter)
+        self.rate_limit_store = RateLimitStore(self.runtime_dir)
 
         self.dispatch_cycle = DispatchCycle(
             watcher=watcher,
@@ -153,6 +155,8 @@ class OrchestratorContext:
             max_handoffs=self.config.max_handoffs,
             terminal_poll_interval_sec=self.config.terminal_poll_interval_sec,
             terminal_grace_sec=self.config.terminal_grace_sec,
+            adapters=adapters,
+            rate_limit_store=self.rate_limit_store,
         )
 
         self.run_duration_guard = RunDurationGuard(self.config.max_run_duration_sec)
